@@ -5,20 +5,25 @@ structure, Qoder custom base64 round-trip), COSY signature layout, request
 body construction, SSE envelope unwrapping, Responses-API custom-tool
 translation, and check-in response normalization.
 
-    python _test_qoder.py
+    python _test_qoder.py --offline  # default
+    python _test_qoder.py --local-credentials  # explicit local inspection only
 """
 import hashlib
 import json
 import os
 import sys
+import argparse
 
+_parser = argparse.ArgumentParser(description=__doc__)
+_mode = _parser.add_mutually_exclusive_group()
+_mode.add_argument('--offline', action='store_true', help='isolated offline tests (default)')
+_mode.add_argument('--local-credentials', action='store_true',
+                   help='also inspect local credential stores; no network')
+_args = _parser.parse_args()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("ACCOUNTS_DIR",
-                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "_acc"))
-os.environ.setdefault("USAGE_DIR",
-                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "_use"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+from offline_support import install as _install_offline
+_test_root = _install_offline(local_credentials=_args.local_credentials)
 
 import qoder_proxy as P
 import qoder_sign as S
@@ -356,412 +361,189 @@ check("dashboard: is_free no longer triggers the 0.00x branch",
       "m.is_free || valley === 0" not in _dash)
 
 print()
-print("[11] transient upstream errors (418/provider_error) — retry not punish")
-import time as _time_for_11
-time = _time_for_11   # 本块直接使用 time.time()/sleep
-# 分类判定
-check("418 + provider_error is transient",
-      P._is_transient_upstream(418, '{"code":"provider_error","message":"Error in upstream response"}'))
+print("[11] transient upstream errors — production recovery, retry not punish")
+import time as _recovery_time
+import io as _recovery_io
+import tempfile as _recovery_temp
+import urllib.error as _recovery_http
+import ssl as _recovery_ssl
+from unittest.mock import patch as _recovery_patch
+from test_recovery import Response as _RecoveryResponse, success as _recovery_success
+from test_recovery import envelope as _recovery_envelope, chunk as _recovery_chunk
+
+
+def _recovery_http_error(status, detail):
+    return _recovery_http.HTTPError("https://synthetic.invalid/chat", status, "fixture", {},
+                                    _recovery_io.BytesIO(detail.encode()))
+
+
+def _run_production_recovery(outcomes, pool=None, real_sleep=False):
+    """离线夹具只拦截 HTTP 和等待，实际执行 Context、签名、恢复及聚合。"""
+    with _recovery_temp.TemporaryDirectory() as directory:
+        if pool is None:
+            pool = A.AccountPool(directory)
+            pool.add(A.Account({"uid": "recovery-fixture", "realm": "cn",
+                                "accessToken": "dt-synthetic", "expiresAt": 9999999999}))
+        account = pool.accounts[0]
+        calls, sleeps, resources, received = [], [], [], []
+        outcomes = iter(outcomes)
+        actual_sleep = _recovery_time.sleep
+
+        def opened(req, **kwargs):
+            calls.append(req)
+            outcome = next(outcomes)
+            resources.append(outcome)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        def waited(seconds):
+            sleeps.append(seconds)
+            if real_sleep:
+                actual_sleep(seconds)
+
+        with _recovery_patch.object(P, "POOL", pool), \
+                _recovery_patch.object(P, "ACCOUNTS_DIR", pool.dir), \
+                _recovery_patch.object(P.urllib.request, "urlopen", side_effect=opened), \
+                _recovery_patch.object(P.time, "sleep", side_effect=waited):
+            context = P.RequestContext({"model": "qfmodel", "messages": [
+                {"role": "user", "content": "hi"}]}, "cn", options={"queue_enabled": False})
+            holder, obj, error = {}, None, None
+            lines = P.iter_with_recovery(context, holder)
+
+            def tracked():
+                for line in lines:
+                    received.append(line)
+                    yield line
+
+            try:
+                obj = P.aggregate_stream(None, "qfmodel", holder=holder, inner_lines=tracked())
+            except P.UpstreamStatus as exc:
+                error = exc
+            finally:
+                lines.close()
+                context.close()
+        return {"obj": obj, "error": error, "account": account, "calls": calls,
+                "sleeps": sleeps, "received": received, "resources": resources,
+                "released": not pool._leases}
+
+
+_provider_detail = '{"code":"provider_error","message":"Error in upstream response"}'
+check("418 + provider_error is transient", P._is_transient_upstream(418, _provider_detail))
 check("503 is transient", P._is_transient_upstream(503, ""))
 check("client param error (invalid_parameter) NEVER transient",
-      not P._is_transient_upstream(400,
-          '{"code":"provider_error","details":"data: {\\"error\\":{\\"code\\":'
-          '\\"invalid_parameter_error\\",\\"message\\":\\"Range of max_tokens should be [1, 131072]\\"}"'))
-check("plain 400 without provider_error not transient",
-      not P._is_transient_upstream(400, '{"code":"bad_request"}'))
+      not P._is_transient_upstream(400, '{"code":"provider_error","details":"invalid_parameter_error Range of max_tokens"}'))
+check("plain 400 without provider_error not transient", not P._is_transient_upstream(400, '{"code":"bad_request"}'))
 check("401 never transient", not P._is_transient_upstream(401, "provider_error"))
 
-# 行为级：第一次 418(瞬时) → 重试后成功，账号不背锅
-import urllib.error as _ue3, io as _io3
-_orig_urlopen = P.urllib.request.urlopen
-_calls = {"n": 0}
+_recovered = _run_production_recovery([_recovery_http_error(418, _provider_detail), _recovery_success()])
+check("418-then-success: production iterator performs in-place retry",
+      _recovered["obj"] is not None and len(_recovered["calls"]) == 2)
+check("418-then-success: account NOT cooled down", _recovered["account"].cooldown_until == 0)
+# 使用可观测 sleep 调用验证原有 1s/2s 退避，避免测试依赖机器调度耗时。
+check("418-then-success: backoff is exactly 1s", _recovered["sleeps"] == [1], _recovered["sleeps"])
 
-class _FakeResp(object):
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
-    def read(self, *a): return b"{}"
-
-def _urlopen_fail_once(req, timeout=None):
-    _calls["n"] += 1
-    if _calls["n"] == 1:
-        raise _ue3.HTTPError(req.full_url, 418, "teapot", {},
-                             _io3.BytesIO(b'{"code":"provider_error","message":"Error in upstream response"}'))
-    return _FakeResp()
-
-try:
-    P.urllib.request.urlopen = _urlopen_fail_once
-    # 构造单账号池
-    import tempfile as _tf
-    _td = _tf.mkdtemp(prefix="qdpool_")
-    _pool = A.AccountPool(_td)
-    _pool.add(A.Account({"uid": "retry-test-uid", "realm": "cn",
-                         "accessToken": "dt-test", "refreshToken": "drt-test",
-                         "expiresAt": 9999999999}))
-    _orig_pool = P.POOL
-    P.POOL = _pool
-    _acc = _pool.accounts[0]
-    _acc.cooldown_until = 0
-    t0 = time.time()
-    resp, used, _ = P.open_upstream(
-        {"model": "qfmodel", "messages": [{"role": "user", "content": "hi"}],
-         "stream": False}, target_realm="cn")
-    took = time.time() - t0
-    check("418-then-success: open_upstream returns after in-place retry",
-          resp is not None and _calls["n"] == 2,
-          {"calls": _calls["n"]})
-    check("418-then-success: account NOT cooled down",
-          _acc.cooldown_until <= time.time(),
-          round(_acc.cooldown_until - time.time(), 1))
-    check("418-then-success: backoff took ~1s (not instant, not 60s)",
-          0.8 <= took <= 4.0, round(took, 2))
-finally:
-    P.urllib.request.urlopen = _orig_urlopen
-
-# 行为级：持续 418 → 重试耗尽后短冷却（单账号 3s 而非 60s）并抛出原错误
-def _urlopen_always_418(req, timeout=None):
-    _calls["n"] += 1
-    raise _ue3.HTTPError(req.full_url, 418, "teapot", {},
-                         _io3.BytesIO(b'{"code":"provider_error","message":"Error in upstream response"}'))
-
-_calls["n"] = 0
-try:
-    P.urllib.request.urlopen = _urlopen_always_418
-    P.POOL = _pool          # 上一块 finally 还原了 None，这里重新挂上临时池
-    _acc.cooldown_until = 0
-    _acc.last_error = ""
-    raised = None
-    t0 = time.time()
-    try:
-        P.open_upstream({"model": "qfmodel",
-                         "messages": [{"role": "user", "content": "hi"}],
-                         "stream": False}, target_realm="cn")
-    except _ue3.HTTPError as e:
-        raised = e
-    took = time.time() - t0
-    check("persistent 418: raised after exactly 3 tries",
-          raised is not None and raised.code == 418 and _calls["n"] == 3,
-          {"calls": _calls["n"], "code": getattr(raised, "code", None)})
-    check("persistent 418: short cooldown (<=5s, single-account pool)",
-          0 < (_acc.cooldown_until - time.time()) <= 5.5,
-          round(_acc.cooldown_until - time.time(), 2))
-    check("persistent 418: bounded backoff time (~3s)",
-          2.0 <= took <= 6.0, round(took, 2))
-finally:
-    P.urllib.request.urlopen = _orig_urlopen
-    P.POOL = _orig_pool
-    import shutil as _sh
-    _sh.rmtree(_td, ignore_errors=True)
-
-# 传输层瞬时故障分类（TLS EOF 等）
-import urllib.error as _ue4
-import ssl as _ssl_for_11
+_persistent = _run_production_recovery([_recovery_http_error(418, _provider_detail) for _ in range(3)])
+raised = _persistent["error"]
+check("persistent 418: raised after exactly 3 tries",
+      raised is not None and raised.status == 418 and len(_persistent["calls"]) == 3)
+check("persistent 418: short cooldown (<=5s, single-account pool)",
+      0 < _persistent["account"].cooldown_until - _recovery_time.time() <= 5.5)
+check("persistent 418: bounded backoff totals exactly 3s", _persistent["sleeps"] == [1, 2])
 check("URLError wrapping SSL EOF is transient transport",
-      P._is_transient_transport(_ue4.URLError(_ssl_for_11.SSLError(
-          "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF"))))
-check("ConnectionResetError is transient transport",
-      P._is_transient_transport(ConnectionResetError("reset")))
-check("plain ValueError NOT transient transport",
-      not P._is_transient_transport(ValueError("nope")))
-check("predicate: URLError+provider401 not transient-http",
-      not P._is_transient_upstream(401, "x"))
-
-# 友好错误映射
-_m, _t = P.friendly_upstream_error(418,
-    '{"code":"provider_error","message":"Error in upstream response"}')
-check("friendly: 418 provider_error -> Chinese retry guidance",
-      "上游瞬时故障" in _m and "请稍后重试" in _m, _m[:60])
-check("friendly: err_type tagged transient",
-      _t == "upstream_transient_error", _t)
-_m2, _t2 = P.friendly_upstream_error(400,
-    '{"code":"provider_error","details":"invalid_parameter_error Range"}')
-check("friendly: client param error NOT reframed as transient",
-      _t2 == "upstream_error" and "上游瞬时故障" not in _m2, (_t2, _m2[:50]))
-check("friendly: detail preserved in message",
-      "provider_error" in _m)
-
-# qoder_detail passthrough（错误体只读一次的修复）——挂在持续418的断言上补充
-check("raised HTTPError carries qoder_detail for handlers",
-      hasattr(raised, "qoder_detail") and "provider_error" in raised.qoder_detail,
-      getattr(raised, "qoder_detail", "")[:60])
+      P._is_transient_transport(_recovery_http.URLError(_recovery_ssl.SSLError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF"))))
+check("ConnectionResetError is transient transport", P._is_transient_transport(ConnectionResetError("reset")))
+check("plain ValueError NOT transient transport", not P._is_transient_transport(ValueError("nope")))
+check("predicate: URLError+provider401 not transient-http", not P._is_transient_upstream(401, "x"))
+_m, _t = P.friendly_upstream_error(418, _provider_detail)
+check("friendly: 418 provider_error -> Chinese retry guidance", "上游瞬时故障" in _m and "请稍后重试" in _m)
+check("friendly: err_type tagged transient", _t == "upstream_transient_error")
+_m2, _t2 = P.friendly_upstream_error(400, '{"code":"provider_error","details":"invalid_parameter_error Range"}')
+check("friendly: client param error NOT reframed as transient", _t2 == "upstream_error" and "上游瞬时故障" not in _m2)
+check("friendly: detail preserved in message", "provider_error" in _m)
+# 新恢复层将错误体读一次后转为 UpstreamStatus.detail，不再挂旧 HTTPError.qoder_detail。
+check("production UpstreamStatus preserves consumed HTTP error body",
+      raised is not None and "provider_error" in raised.detail)
 
 print()
-print("[12] in-stream envelope retry (200-then-418 form — the reported log shape)")
-# 状态归一化
-check("_to_int_status str/int/fallback", P._to_int_status("418") == 418
-      and P._to_int_status(503) == 503 and P._to_int_status("xx") == 502)
-
-_env418 = P.UpstreamStatus(
-    418, '{"code":"provider_error","message":"Error in upstream response"}')
-check("fresh envelope 418 transient -> retry",
-      P.should_retry_envelope(_env418, emitted_bytes=False, attempt=0))
-check("already emitted bytes -> NO retry",
-      not P.should_retry_envelope(_env418, emitted_bytes=True, attempt=0))
-check("budget exhausted -> NO retry",
-      not P.should_retry_envelope(_env418, False, P.TRANSIENT_MAX_RETRIES))
-_env_param = P.UpstreamStatus(400, "invalid_parameter_error Range of max_tokens")
-check("client param envelope -> NO retry",
-      not P.should_retry_envelope(_env_param, False, 0))
-
-# aggregate_with_envelope_retry: 第一次信封418 → 重开上游 → 成功
-_sleeps = []
-_orig_sleep2 = P.time.sleep
-_orig_open2 = P.open_upstream
-_pools = {"calls": 0}
-
-class _GoodResp(object):
-    def __iter__(self):
-        inner = json.dumps({"choices": [{"delta": {"content": "recovered"}}]})
-        yield ("data: " + json.dumps({"statusCodeValue": 200, "body": inner})
-               + "\n\n").encode("utf-8")
-        yield b'data: {"statusCodeValue":200,"body":"[DONE]"}\n\n'
-
-    def close(self):
-        pass
-
-
-class _ErrResp(object):
-    def __iter__(self):
-        yield ("data: " + json.dumps({
-            "statusCodeValue": 418,
-            "body": '{"code":"provider_error","message":"Error in upstream response"}'})
-            + "\n\n").encode("utf-8")
-
-    def close(self):
-        pass
-
-
-def _fake_open(payload, session_key=None, target_realm=None):
-    _pools["calls"] += 1
-    return _GoodResp(), "acct-1", "enc"
-
-
-class _A(object):
-    uid = "acct-1"
-
-
-try:
-    P.time.sleep = lambda s: _sleeps.append(s)
-    P.open_upstream = _fake_open
-    obj, acc = P.aggregate_with_envelope_retry(
-        _ErrResp(), {"model": "qfmodel"}, None, "cn", "qfmodel",
-        {"usage": None}, _A())
-    check("envelope 418 -> reopened upstream and recovered",
-          obj["choices"][0]["message"]["content"] == "recovered",
-          obj["choices"][0]["message"].get("content"))
-    check("reopen happened exactly once", _pools["calls"] == 1, _pools["calls"])
-    check("backoff 1s recorded", _sleeps == [1], _sleeps)
-finally:
-    P.time.sleep = _orig_sleep2
-    P.open_upstream = _orig_open2
-
-# 非瞬时信封（客户端参数错）不重开、原样上抛
-_sleeps2 = []
-_pools2 = {"calls": 0}
+print("[12] in-stream envelope retry — shared production budget")
+check("production error classifier normalizes str/int/fallback status",
+      P.qoder_errors.classify("418", _provider_detail).upstream_http_status == 418
+      and P.qoder_errors.classify(503, "").upstream_http_status == 503
+      and P.qoder_errors.classify("xx", "").upstream_http_status == 502)
+_envelope_result = _run_production_recovery([
+    _RecoveryResponse(_recovery_envelope(_provider_detail, 418)), _recovery_success()])
+check("fresh envelope 418 transient -> production retry", len(_envelope_result["calls"]) == 2)
+_partial_result = _run_production_recovery([
+    _RecoveryResponse(_recovery_chunk("partial"), _recovery_envelope(_provider_detail, 418))])
+check("already emitted business bytes -> NO retry",
+      len(_partial_result["calls"]) == 1 and len(_partial_result["received"]) == 1 and _partial_result["error"] is not None)
+_budget_result = _run_production_recovery([
+    _RecoveryResponse(_recovery_envelope(_provider_detail, 418)) for _ in range(3)])
+check("shared retry budget exhausted -> NO fourth POST",
+      len(_budget_result["calls"]) == 3 and _budget_result["error"] is not None)
+_param_result = _run_production_recovery([
+    _RecoveryResponse(_recovery_envelope("invalid_parameter_error Range of max_tokens", 400))])
+check("client param envelope -> NO retry", len(_param_result["calls"]) == 1 and not _param_result["sleeps"])
+check("envelope 418 -> reopened upstream and recovered",
+      _envelope_result["obj"]["choices"][0]["message"]["content"] == "recovered")
+check("reopen happened exactly once", len(_envelope_result["calls"]) - 1 == 1)
+check("backoff 1s recorded", _envelope_result["sleeps"] == [1])
 
 print()
-print("[13] content-policy rejection (DataInspectionFailed — 02:27 log root cause)")
-_DI_DETAIL = ('{"error":{"message":"\\u003c400\\u003e InternalError.Algo.'
-              'DataInspectionFailed: Input text data may contain inappropriate '
-              'content.","type":"UnknownError"}}')
-check("DataInspection detail -> NOT transient (no wasted retries)",
-      not P._is_transient_upstream(418, _DI_DETAIL))
-check("DataInspection envelope -> should_retry_envelope False",
-      not P.should_retry_envelope(
-          P.UpstreamStatus(418, _DI_DETAIL), emitted_bytes=False, attempt=0))
+print("[13] content-policy rejection — production recovery never penalizes account")
+_DI_DETAIL = '{"error":{"message":"<400> InternalError.Algo.DataInspectionFailed: Input text data may contain inappropriate content.","type":"UnknownError"}}'
+check("DataInspection detail -> NOT transient (no wasted retries)", not P._is_transient_upstream(418, _DI_DETAIL))
+_di_result = _run_production_recovery([_RecoveryResponse(_recovery_envelope(_DI_DETAIL, 418))])
+check("DataInspection envelope -> production NO retry", len(_di_result["calls"]) == 1 and not _di_result["sleeps"])
 _m13, _t13 = P.friendly_upstream_error(418, _DI_DETAIL)
-check("friendly: content-policy Chinese explanation",
-      "内容安全审核未通过" in _m13 and "重试无效" in _m13, _m13[:70])
-check("friendly: err_type content_policy_rejected",
-      _t13 == "content_policy_rejected", _t13)
-check("friendly: original detail preserved",
-      "DataInspectionFailed" in _m13)
+check("friendly: content-policy Chinese explanation", "内容安全审核未通过" in _m13 and "重试无效" in _m13)
+check("friendly: err_type content_policy_rejected", _t13 == "content_policy_rejected")
+check("friendly: original detail preserved", "DataInspectionFailed" in _m13)
 
 print()
-print("[14] error-cooldown vs upstream-frequency (no misleading 429)")
-import time as _t14
-# 构造临时池：账号仅处于错误冷却
-_td14 = __import__("tempfile").mkdtemp(prefix="qd14_")
-_pool14 = A.AccountPool(_td14)
-_acc14 = A.Account({"uid": "u14", "realm": "cn", "accessToken": "dt-x",
-                    "refreshToken": "drt-x", "expiresAt": 9999999999})
-_pool14.add(_acc14)
-_orig_pool14 = P.POOL
-P.POOL = _pool14
-try:
-    # (a) 仅账号错误冷却 -> 不算频控
-    _acc14.cooldown_until = _t14.time() + 5
-    _acc14.model_cooldowns.clear()
-    throttled, w = P.realm_model_throttled("cn", "qfmodel")
-    check("account error-cooldown is NOT a frequency-limit (no 429)",
-          throttled is False, (throttled, w))
-    check("retry_after_seconds ignores account cooldown",
-          P.retry_after_seconds("qfmodel", "cn") == 60,
-          P.retry_after_seconds("qfmodel", "cn"))
-    wait = P._short_error_cooldown_wait("cn", "qfmodel")
-    check("short error-cooldown wait surfaced (<=10s, >0)",
-          0 < wait <= 10, wait)
-    # (b) 上游频控 -> 正当429
-    _acc14.cooldown_until = 0
-    _acc14.model_cooldowns["qfmodel"] = _t14.time() + 60
-    throttled2, w2 = P.realm_model_throttled("cn", "qfmodel")
-    check("model_cooldowns (upstream 429) IS frequency-limit",
-          throttled2 is True and w2 >= 59, (throttled2, w2))
-    check("short wait suppressed while frequency-limited",
-          P._short_error_cooldown_wait("cn", "qfmodel") == 0.0)
-    check("retry_after reflects frequency wait",
-          59 <= P.retry_after_seconds("qfmodel", "cn") <= 61,
-          P.retry_after_seconds("qfmodel", "cn"))
-    # (c) 行为：错误短冷却 -> 等待后续上（真实 sleep ~0.3s）而不是429
-    _acc14.model_cooldowns.clear()
-    _acc14.cooldown_until = _t14.time() + 0.3
-    _orig_urlopen14 = P.urllib.request.urlopen
+print("[14] error-cooldown vs upstream-frequency — production lease selection")
+with _recovery_temp.TemporaryDirectory() as _td14:
+    _pool14 = A.AccountPool(_td14)
+    _acc14 = A.Account({"uid": "u14", "realm": "cn", "accessToken": "dt-synthetic", "expiresAt": 9999999999})
+    _pool14.add(_acc14)
+    with _recovery_patch.object(P, "POOL", _pool14):
+        _acc14.cooldown_until = _recovery_time.time() + 5
+        _acc14.model_cooldowns.clear()
+        throttled, w = P.realm_model_throttled("cn", "qfmodel")
+        check("account error-cooldown is NOT a frequency-limit (no 429)", throttled is False)
+        check("retry_after_seconds ignores account cooldown", P.retry_after_seconds("qfmodel", "cn") == 60)
+        wait = P._short_error_cooldown_wait("cn", "qfmodel")
+        check("short error-cooldown wait surfaced (<=10s, >0)", 0 < wait <= 10)
+        _acc14.cooldown_until = 0
+        _acc14.model_cooldowns["qfmodel"] = _recovery_time.time() + 60
+        throttled2, w2 = P.realm_model_throttled("cn", "qfmodel")
+        check("model_cooldowns (upstream 429) IS frequency-limit", throttled2 is True and w2 >= 59)
+        check("short wait suppressed while frequency-limited", P._short_error_cooldown_wait("cn", "qfmodel") == 0.0)
+        check("retry_after reflects frequency wait", 59 <= P.retry_after_seconds("qfmodel", "cn") <= 61)
+        _acc14.model_cooldowns.clear()
+        _acc14.cooldown_until = _recovery_time.time() + 0.3
+        _wait_result = _run_production_recovery([_recovery_success()], pool=_pool14, real_sleep=True)
+        check("short cooldown: request WAITS and serves (no 429/503)", _wait_result["obj"] is not None and _wait_result["error"] is None)
+        check("short cooldown: exactly one bounded wait",
+              len(_wait_result["sleeps"]) == 1 and 0.25 <= sum(_wait_result["sleeps"]) <= 2.0, _wait_result["sleeps"])
+        _acc14.cooldown_until = 0
+        _acc14.model_cooldowns["qfmodel"] = _recovery_time.time() + 60
+        _limited = _run_production_recovery([], pool=_pool14)
+        check("genuine frequency limit raises production 429 without POST",
+              _limited["error"] is not None and _limited["error"].info.public_http_status == 429
+              and not _limited["calls"] and not _limited["sleeps"])
 
-    class _R14(object):
-        def __iter__(self):
-            inner = json.dumps({"choices": [{"delta": {"content": "after-wait"}}]})
-            yield ("data: " + json.dumps({"statusCodeValue": 200, "body": inner})
-                   + "\n\n").encode()
-            yield b'data: {"statusCodeValue":200,"body":"[DONE]"}\n\n'
-        def close(self):
-            pass
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
-
-    def _ok_urlopen(req, timeout=None):
-        return _R14()
-
-    try:
-        P.urllib.request.urlopen = _ok_urlopen
-        _sleep_used = []
-        _t0 = _t14.time()
-        try:
-            resp, used, _ = P.open_upstream(
-                {"model": "qfmodel",
-                 "messages": [{"role": "user", "content": "hi"}],
-                 "stream": False}, target_realm="cn")
-            _served = True
-            _rate = None
-        except Exception as _e:
-            _served = False
-            _rate = _e
-        took = _t14.time() - _t0
-        check("short cooldown: request WAITS and serves (no 429/503)",
-              _served and _rate is None,
-              {"served": _served, "err": repr(_rate)})
-        check("wait lasted ~0.3-1s (bounded)", 0.25 <= took <= 2.0,
-              round(took, 2))
-    finally:
-        P.urllib.request.urlopen = _orig_urlopen14
-    # (d) 频控行为不变：真429 仍然立刻 RateLimited
-    _acc14.cooldown_until = 0
-    _acc14.model_cooldowns["qfmodel"] = _t14.time() + 60
-    try:
-        P.urllib.request.urlopen = _ok_urlopen
-        _raised14 = None
-        try:
-            P.open_upstream({"model": "qfmodel",
-                             "messages": [{"role": "user", "content": "hi"}],
-                             "stream": False}, target_realm="cn")
-        except Exception as e14:
-            _raised14 = e14
-        check("genuine frequency limit still raises RateLimited fast",
-              isinstance(_raised14, P.RateLimited)
-              and "frequency" in str(getattr(_raised14, "detail", "")),
-              repr(_raised14))
-    finally:
-        P.urllib.request.urlopen = _orig_urlopen14
-finally:
-    P.POOL = _orig_pool14
-    _acc14.model_cooldowns.clear()
-    _acc14.cooldown_until = 0
-    import shutil as _sh14
-    _sh14.rmtree(_td14, ignore_errors=True)
-
-# favicon 404 静默
 check("log_message silences favicon regardless of status (code present)",
-      'req_path == "/favicon.ico"' in open(
-          os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "qoder_proxy.py"), encoding="utf-8").read())
-
-# 行为：内容审核信封 -> 一次都不重开（open_upstream 不被再次调用）并上抛
-class _DiErrResp(object):
-    def __iter__(self):
-        yield ("data: " + json.dumps({
-            "statusCodeValue": 418, "body": _DI_DETAIL}) + "\n\n").encode()
-
-    def close(self):
-        pass
-    def __enter__(self):
-        return self
-    def __exit__(self, *a):
-        return False
-
-
-_pools13 = {"calls": 0}
-_sleeps13 = []
-
-
-def _fake_open_never13(payload, session_key=None, target_realm=None):
-    _pools13["calls"] += 1
-    return _GoodResp(), "acct-1", "enc"
-
-
-try:
-    P.time.sleep = lambda s: _sleeps13.append(s)
-    P.open_upstream = _fake_open_never13
-    _raised13 = None
-    try:
-        P.aggregate_with_envelope_retry(
-            _DiErrResp(), {"model": "Qwen3.8-Flash"}, None, "cn",
-            "Qwen3.8-Flash", {"usage": None}, _A())
-    except P.UpstreamStatus as e13:
-        _raised13 = e13
-    check("content-policy envelope: raised immediately, ZERO reopen, ZERO sleep",
-          _raised13 is not None and _pools13["calls"] == 0 and not _sleeps13,
-          {"raised": _raised13 is not None, "reopen": _pools13["calls"],
-           "sleeps": _sleeps13})
-finally:
-    P.time.sleep = _orig_sleep2
-    P.open_upstream = _orig_open2
-
-# 非瞬时信封（客户端参数错）不重开、原样上抛
-_sleeps2 = []
-_pools2 = {"calls": 0}
-
-class _ParamErrResp(object):
-    def __iter__(self):
-        yield ("data: " + json.dumps({
-            "statusCodeValue": 400,
-            "body": "invalid_parameter_error Range of max_tokens [1, 131072]"})
-            + "\n\n").encode("utf-8")
-
-    def close(self):
-        pass
-
-
-def _fake_open_never(payload, session_key=None, target_realm=None):
-    _pools2["calls"] += 1
-    return _GoodResp(), "acct-1", "enc"
-
-
-try:
-    P.time.sleep = lambda s: _sleeps2.append(s)
-    P.open_upstream = _fake_open_never
-    _raised_env = None
-    try:
-        P.aggregate_with_envelope_retry(
-            _ParamErrResp(), {"model": "qfmodel"}, None, "cn", "qfmodel",
-            {"usage": None}, _A())
-    except P.UpstreamStatus as e0:
-        _raised_env = e0
-    check("param envelope raises immediately (no reopen)",
-          _raised_env is not None and _pools2["calls"] == 0,
-          {"raised": _raised_env is not None, "reopen": _pools2["calls"]})
-finally:
-    P.time.sleep = _orig_sleep2
-    P.open_upstream = _orig_open2
+      'req_path == "/favicon.ico"' in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "qoder_proxy.py"), encoding="utf-8").read())
+check("content-policy envelope: raised immediately, ZERO reopen, ZERO sleep",
+      _di_result["error"] is not None and len(_di_result["calls"]) == 1 and not _di_result["sleeps"])
+check("param envelope raises immediately (no reopen)", _param_result["error"] is not None and len(_param_result["calls"]) == 1)
+check("production recovery releases all leases on success and failure",
+      all(result["released"] for result in (_recovered, _persistent, _envelope_result, _partial_result, _budget_result, _param_result, _di_result)))
+check("parameter and content errors leave accounts enabled without cooldown",
+      all(result["account"].enabled and result["account"].cooldown_until == 0
+          and not result["account"].model_cooldowns for result in (_param_result, _di_result)))
 
 ctx = {m["key"]: m.get("max_input_tokens") for m in C.STATIC_CN_MODELS}
 check("cn dmodel ctx = official 96000 (NOT a guess)", ctx.get("dmodel") == 96000,
@@ -1109,9 +891,9 @@ check("device family", A.token_family(acc_d) == "device")
 check("job family", A.token_family(acc_j) == "job")
 
 print()
-print("[4.5] credential / model-cache crypto KATs (official fixtures)")
+print("[4.5] credential / model-cache crypto KATs (independent synthetic fixtures)")
 import base64 as _b64
-_FIX = r"C:\Users\shuishui\AppData\Local\Temp\qoder-ref\cli2api\testdata\protocol\1.1.34"
+_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests", "fixtures")
 if os.path.isdir(_FIX):
     fx = json.load(open(os.path.join(_FIX, "credential.json"), encoding="utf-8"))
     mkey = fx["input"]["machine_key"].encode()
@@ -1131,31 +913,48 @@ if os.path.isdir(_FIX):
     blk = bytes(range(16))
     rks = S._expand_key(k256)
     check("AES-256 key schedule = 15 round keys", len(rks) == 15, len(rks))
-    check("AES-256 block roundtrip",
-          S._decrypt_block(S._encrypt_block(blk, rks), rks) == blk)
+    # FIPS-197 Appendix C.3: independent AES-256 known answer.
+    blk = bytes.fromhex("00112233445566778899aabbccddeeff")
+    expected = bytes.fromhex("8ea2b7ca516745bfeafc49904b496089")
+    check("FIPS-197 C.3 AES-256 encrypt", S._encrypt_block(blk, rks) == expected)
+    check("FIPS-197 C.3 AES-256 decrypt", S._decrypt_block(expected, rks) == blk)
+    sealed = bytearray(_b64.b64decode(mf["expected"]["encrypted"]))
+    sealed[-1] ^= 1
+    for label, ciphertext, uid in (
+        ("wrong uid", mf["expected"]["encrypted"], "wrong-synthetic-uid"),
+        ("altered tag", _b64.b64encode(sealed).decode(), mf["input"]["uid"]),
+    ):
+        try:
+            S.qmc_decrypt(ciphertext, uid)
+            check("QMC rejects " + label, False)
+        except ValueError:
+            check("QMC rejects " + label, True)
 else:
-    check("official crypto fixtures present", False, _FIX)
+    check("independent crypto fixtures present", False, _FIX)
 
 print()
-print("[4.6] local credential scan (reads THIS machine's official stores)")
-try:
-    import qoder_accounts as _QA
-    detected = _QA.scan_desktop_credentials()
-    check("scan returns both realms", len(detected) >= 2, len(detected))
-    realms_seen = {d["realm"] for d in detected}
-    check("scan covers intl + cn", realms_seen == {"intl", "cn"}, realms_seen)
-    valid = [d for d in detected if d.get("valid")]
-    # 本机是否登录过属于环境状态：登录过则必须解出 uid/dt- 前缀
-    if valid:
-        check("valid entries carry uid + dt- token prefix",
-              all(d["uid"] and d.get("kind") for d in valid),
-              [(d["realm"], d.get("kind"), d.get("uid", "")[:8]) for d in valid])
-        check("app entries decrypted via os_crypt (kind=app uid present)",
-              all(d.get("uid") for d in valid if d["kind"] == "app"))
-    else:
-        check("scan ran without crash (no valid creds on this machine)", True)
-except Exception as exc:
-    check("local credential scan", False, exc)
+if _args.local_credentials:
+    print("[4.6] local credential scan (reads THIS machine's official stores)")
+    try:
+        import qoder_accounts as _QA
+        detected = _QA.scan_desktop_credentials()
+        check("scan returns both realms", len(detected) >= 2, len(detected))
+        realms_seen = {d["realm"] for d in detected}
+        check("scan covers intl + cn", realms_seen == {"intl", "cn"}, realms_seen)
+        valid = [d for d in detected if d.get("valid")]
+        # 本机是否登录过属于环境状态：登录过则必须解出 uid/dt- 前缀
+        if valid:
+            check("valid entries carry uid + dt- token prefix",
+                  all(d["uid"] and d.get("kind") for d in valid),
+                  [(d["realm"], d.get("kind"), d.get("uid", "")[:8]) for d in valid])
+            check("app entries decrypted via os_crypt (kind=app uid present)",
+                  all(d.get("uid") for d in valid if d["kind"] == "app"))
+        else:
+            check("scan ran without crash (no valid creds on this machine)", True)
+    except Exception as exc:
+        check("local credential scan", False, exc)
+else:
+    print("[SKIP] local credential scan: requires --local-credentials")
 
 print()
 print("[10] gateway plumbing")
@@ -1195,5 +994,6 @@ check("fingerprint string sanitized",
       P.sanitize_text("You are Claude Code, Anthropic's official CLI for Claude"))
 
 print()
+check("no real network or credential access attempted", not _test_root.forbidden_attempts)
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

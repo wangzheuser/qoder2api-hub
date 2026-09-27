@@ -15,6 +15,7 @@
 import base64
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -28,6 +29,11 @@ from pathlib import Path
 import uuid
 
 from qoder_fingerprint import derive_id, generate_request_id
+from qoder_catalog import resolve_upstream_key
+
+
+def _model_key(model, realm):
+    return resolve_upstream_key(model, realm=realm) if model else None
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -106,9 +112,13 @@ def detect_realm_from_domain(domain):
 
 
 def normalize_epoch(value):
+    if isinstance(value, bool):
+        return 0
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(number) or number <= 0:
         return 0
     if number > 1e11:      # 毫秒
         number /= 1000.0
@@ -259,6 +269,13 @@ class Account(object):
         self.user_type = str(data.get("userType") or "") or DEFAULT_USER_TYPE
         self.organization_id = str(data.get("organizationId") or "")
         self.organization_name = str(data.get("organizationName") or "")
+        self._save_lock = threading.RLock()
+        self._refresh_lock = threading.RLock()
+        self._health_lock = threading.RLock()
+        self._retired = False
+        self._pool = None
+        self._error_version = 0
+        self.last_error_kind = ""
 
     # -- 持久化 ------------------------------------------------------------
     def to_dict(self):
@@ -287,7 +304,7 @@ class Account(object):
 
     def public(self):
         exp = self.expires_at
-        return {
+        result = {
             "uid": self.uid,
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
             "domain": self.domain,
@@ -313,14 +330,28 @@ class Account(object):
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": derive_id(self.uid, "session"),
         }
+        result.update(self._pool.health(self) if self._pool else {
+            "inFlight": 0, "maxInflight": 0, "queueWaiting": 0,
+            "modelCooldowns": dict(self.model_cooldowns),
+            "lastErrorKind": self.last_error_kind,
+        })
+        return result
 
     def save(self, directory):
+        with self._save_lock:
+            if self._retired:
+                return self.path
+            return self._save(directory)
+
+    def _save(self, directory):
         base = Path(directory).resolve()
         base.mkdir(parents=True, exist_ok=True)
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
         name = (safe_uid or uuid.uuid4().hex) + ".json"
         path = base / name
-        tmp = base / (name + ".tmp")
+        if self.path and Path(self.path).parent.resolve() == base:
+            path = Path(self.path)
+        tmp = base / (path.name + "." + uuid.uuid4().hex + ".tmp")
         if not (path.is_relative_to(base) and tmp.is_relative_to(base)):
             raise ValueError("invalid path for account save")
         tmp.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
@@ -330,11 +361,14 @@ class Account(object):
         return self.path
 
     def delete(self):
-        if self.path and os.path.exists(self.path):
-            os.remove(self.path)
+        with self._save_lock:
+            self._retired = True
+            if self.path and os.path.exists(self.path):
+                os.remove(self.path)
 
     # -- 健康与冷却 --------------------------------------------------------
     def ready(self, model=None):
+        model = _model_key(model, self.realm)
         if not self.enabled or not self.access_token:
             return False
         if self.cooldown_until > time.time():
@@ -348,22 +382,36 @@ class Account(object):
         if remaining > 240:          # 剩余 >4 分钟直接用（jt- 24h / dt- 30d）
             return True
         if remaining > 0:
-            self.refresh()
+            self.refresh_if_needed()
             return True
-        return self.refresh()
+        return self.refresh_if_needed()
 
-    def note_error(self, message, cooldown=60, single_account=False, model=None, until=None):
-        self.last_error = str(message)[:200]
-        if model:
-            wait = max(1.0, float(until) - time.time()) if until else (
-                3.0 if single_account else float(cooldown))
-            self.model_cooldowns[model] = time.time() + wait
-            return
-        actual_cooldown = 3 if single_account else cooldown
-        self.cooldown_until = time.time() + actual_cooldown
+    def refresh_if_needed(self):
+        with self._refresh_lock:
+            if not self.expires_at or self.expires_at - time.time() > 240:
+                return True
+            return self.refresh()
+
+    def note_error(self, message, cooldown=60, single_account=False, model=None, until=None, kind=None):
+        model = _model_key(model, self.realm)
+        with self._health_lock:
+            self._error_version += 1
+            self.last_error = str(message)[:200]
+            self.last_error_kind = str(kind or "")
+            if model:
+                wait = max(1.0, float(until) - time.time()) if until else (
+                    3.0 if single_account else float(cooldown))
+                self.model_cooldowns[model] = max(self.model_cooldowns.get(model, 0), time.time() + wait)
+            else:
+                self.cooldown_until = max(self.cooldown_until, time.time() + (3 if single_account else cooldown))
+        if self._pool:
+            self._pool.save_state()
+        if self.path:
+            self.save(os.path.dirname(self.path))
 
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
+        model = _model_key(model, self.realm)
         if not self.enabled or not self.access_token:
             return 0.0
         now = time.time()
@@ -372,14 +420,22 @@ class Account(object):
             wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))
         return wait
 
-    def clear_error(self, model=None):
-        if model:
-            self.model_cooldowns.pop(model, None)
-        else:
-            self.model_cooldowns.clear()
-        if self.last_error or self.cooldown_until:
-            self.last_error = ""
-            self.cooldown_until = 0
+    def clear_error(self, model=None, force=False, version=None):
+        with self._health_lock:
+            now = time.time()
+            if version is not None and version != self._error_version:
+                return
+            before = (dict(self.model_cooldowns), self.cooldown_until, self.last_error, self.last_error_kind)
+            self.model_cooldowns = {k: v for k, v in self.model_cooldowns.items()
+                                    if not force and v > now}
+            if force or self.cooldown_until <= now:
+                self.cooldown_until = 0
+            if not self.cooldown_until and not self.model_cooldowns:
+                self.last_error = ""
+                self.last_error_kind = ""
+            changed = before != (self.model_cooldowns, self.cooldown_until, self.last_error, self.last_error_kind)
+        if changed and self._pool:
+            self._pool.save_state()
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
@@ -398,6 +454,10 @@ class Account(object):
 
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
+        with self._refresh_lock:
+            return self._refresh()
+
+    def _refresh(self):
         """刷新 access token。drt- 走 deviceToken，jrt-/PAT 走 jobToken。
 
         PAT 永不覆盖活跃的 OAuth 会话，只做 jrt- 过期后的最终兜底。
@@ -461,8 +521,7 @@ class Account(object):
         self.access_token = token
         self.refresh_token = refresh
         self.expires_at = exp or self.expires_at
-        self.last_error = ""
-        self.cooldown_until = 0
+        self.clear_error()
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
         try:
@@ -757,6 +816,43 @@ def add_to_pool(account):
     return _ACTIVE_POOL.add(account)
 
 
+class PoolBusy(RuntimeError):
+    """合格账号的并发容量已用尽。"""
+
+
+class AccountLease:
+    def __init__(self, pool, account):
+        self._pool = pool
+        self.account = account
+        self._lease_id = uuid.uuid4().hex
+        self.acquired_at = time.time()
+        self.phase = "active"
+        self.error_version = account._error_version
+
+    @property
+    def lease_id(self):
+        return self._lease_id
+
+    def release(self):
+        with self._pool._lock:
+            self._pool._leases.pop(self.lease_id, None)
+            self.phase = "released"
+
+    def set_queue_waiting(self, waiting):
+        with self._pool._lock:
+            if self.lease_id in self._pool._leases:
+                self.phase = "queue" if waiting else "active"
+
+    def mark_success(self):
+        self.account.clear_error(version=self.error_version)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
 class AccountPool(object):
     def __init__(self, directory, log=None):
         global _ACTIVE_POOL
@@ -766,6 +862,9 @@ class AccountPool(object):
         self.logins = {}
         self._lock = threading.RLock()
         self._cursor = 0
+        self._leases = {}
+        self._max_inflight = 0
+        self._state_lock = threading.RLock()
         self.affinity = SessionAffinity()
         _ACTIVE_POOL = self
 
@@ -787,8 +886,126 @@ class AccountPool(object):
                     self.log("account %s unreadable: %s" % (name, exc))
                     continue
                 if account.uid:
+                    account._pool = self
                     self.accounts.append(account)
+            self._load_state()
             return self.accounts
+
+    def _load_state(self):
+        try:
+            with open(os.path.join(self.dir, ".runtime", "pool-state.json"), encoding="utf-8") as fh:
+                state = json.load(fh)
+            if state.get("version") != 1:
+                return
+            rows = state.get("accounts", [])
+            current = {(a.realm, a.uid): a for a in self.accounts}
+            for row in rows:
+                account = current.get((row.get("realm"), row.get("uid")))
+                if account is None:
+                    continue
+                cooldowns = row.get("modelCooldowns", {})
+                if not isinstance(cooldowns, dict):
+                    continue
+                for model, expiry in cooldowns.items():
+                    if isinstance(expiry, (float, int)) and not isinstance(expiry, bool) and math.isfinite(expiry) and expiry > time.time():
+                        key = _model_key(model, account.realm)
+                        account.model_cooldowns[key] = max(account.model_cooldowns.get(key, 0), expiry)
+                account.last_error_kind = str(row.get("lastErrorKind") or "")[:80]
+        except FileNotFoundError:
+            pass
+        except (ValueError, TypeError, AttributeError, OSError) as exc:
+            self.log("pool state unreadable: %s" % exc)
+
+    def save_state(self):
+        try:
+            self._save_state()
+        except OSError as exc:
+            self.log("pool state save failed: %s" % exc)
+
+    def _save_state(self):
+        # 写锁内取得最新对象状态，避免较早快照晚落盘。
+        with self._state_lock:
+            snapshot = tuple(self.accounts)
+            rows = []
+            for account in snapshot:
+                if account._retired:
+                    continue
+                with account._health_lock:
+                    cooldowns = {k: v for k, v in account.model_cooldowns.items() if v > time.time()}
+                    if cooldowns or account.last_error_kind:
+                        rows.append({"realm": account.realm, "uid": account.uid,
+                                     "modelCooldowns": cooldowns, "lastErrorKind": account.last_error_kind})
+            base = Path(self.dir) / ".runtime"
+            base.mkdir(parents=True, exist_ok=True)
+            path = base / "pool-state.json"
+            tmp = base / (uuid.uuid4().hex + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "accounts": rows}, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+
+    def health(self, account):
+        with self._lock:
+            leases = [lease for lease in self._leases.values()
+                      if (lease.account.realm, lease.account.uid) == (account.realm, account.uid)]
+            with account._health_lock:
+                cooldowns = {k: v for k, v in account.model_cooldowns.items() if v > time.time()}
+            return {"inFlight": len(leases), "maxInflight": self._max_inflight,
+                    "queueWaiting": sum(lease.phase == "queue" for lease in leases),
+                    "modelCooldowns": cooldowns,
+                    "lastErrorKind": account.last_error_kind}
+
+    def acquire(self, realm=None, model=None, session_key=None, exclude=None, max_inflight=0):
+        excluded = set(exclude or ())
+        model_keys = {r: _model_key(model, r) for r in REALM_CONFIGS}
+        busy = False
+        while True:
+            lease = None
+            with self._lock:
+                self._max_inflight = max_inflight
+                snapshot = [a for a in self.accounts if (not realm or a.realm == realm) and a.uid not in excluded]
+                if snapshot:
+                    start = self._cursor % len(snapshot)
+                    candidates = snapshot[start:] + snapshot[:start]
+                    bound = self.affinity.get(session_key) if session_key else None
+                    candidates.sort(key=lambda a: a.uid != bound)
+                    for account in candidates:
+                        key = model_keys[account.realm]
+                        if not self._eligible(account, key):
+                            continue
+                        count = sum((l.account.realm, l.account.uid) == (account.realm, account.uid)
+                                    for l in self._leases.values())
+                        if max_inflight and count >= max_inflight:
+                            busy = True
+                            continue
+                        account._pool = self
+                        lease = AccountLease(self, account)
+                        self._leases[lease.lease_id] = lease
+                        self._cursor += 1
+                        break
+            if lease is None:
+                if busy:
+                    raise PoolBusy("account_pool_busy")
+                return None
+            account = lease.account
+            try:
+                refreshed = account.refresh_if_needed()
+                with self._lock:
+                    valid = (refreshed and account in self.accounts and
+                             self._eligible(account, model_keys[account.realm]))
+                    if valid:
+                        if session_key:
+                            self.affinity.bind(session_key, account.uid)
+                        return lease
+            except Exception:
+                lease.release()
+                raise
+            lease.release()
+            excluded.add(account.uid)
+
+    @staticmethod
+    def _eligible(account, model):
+        now = time.time()
+        return (not account._retired and account.enabled and bool(account.access_token)
+                and account.cooldown_until <= now and account.model_cooldowns.get(model, 0) <= now)
 
     def list_public(self, realm=None):
         with self._lock:
@@ -805,22 +1022,34 @@ class AccountPool(object):
 
     def add(self, account):
         with self._lock:
-            existing = self.get(account.uid)
-            if existing is not None:
-                account.added_at = existing.added_at
-                account.path = existing.path
-                if not account.credits and existing.credits:
-                    account.credits = existing.credits
-                if not account.plan and existing.plan:
-                    account.plan = existing.plan
-                if not account.last_checkin and existing.last_checkin:
-                    account.last_checkin = existing.last_checkin
-                if not account.personal_token and existing.personal_token:
-                    account.personal_token = existing.personal_token
-                self.accounts[self.accounts.index(existing)] = account
-            else:
-                self.accounts.append(account)
-            account.save(self.dir)
+            if any(a.uid == account.uid and a.realm != account.realm for a in self.accounts):
+                raise ValueError("account uid belongs to a different realm")
+            existing = next((a for a in self.accounts if (a.realm, a.uid) == (account.realm, account.uid)), None)
+            # 持有旧对象写锁直到持久化及对象交换结束，阻止刷新晚写覆盖新凭证。
+            with existing._save_lock if existing is not None else account._save_lock:
+                if existing is not None:
+                    account.added_at = existing.added_at
+                    account.path = existing.path
+                    if not account.credits and existing.credits:
+                        account.credits = existing.credits
+                    if not account.plan and existing.plan:
+                        account.plan = existing.plan
+                    if not account.last_checkin and existing.last_checkin:
+                        account.last_checkin = existing.last_checkin
+                    if not account.personal_token and existing.personal_token:
+                        account.personal_token = existing.personal_token
+                    with existing._health_lock:
+                        account.model_cooldowns = dict(existing.model_cooldowns)
+                        account.last_error_kind = existing.last_error_kind
+                        account._error_version = existing._error_version
+                account.save(self.dir)
+                if existing is not None:
+                    if existing is not account:
+                        existing._retired = True
+                    self.accounts[self.accounts.index(existing)] = account
+                else:
+                    self.accounts.append(account)
+                account._pool = self
             return account
 
     def remove(self, uid):
@@ -886,7 +1115,7 @@ class AccountPool(object):
             return None
         account.enabled = bool(enabled)
         if enabled:
-            account.clear_error()
+            account.clear_error(force=True)
         account.save(self.dir)
         return account.public()
 
@@ -897,70 +1126,56 @@ class AccountPool(object):
                     continue
                 account.enabled = bool(enabled)
                 if enabled:
-                    account.clear_error()
+                    account.clear_error(force=True)
                 account.save(self.dir)
 
     # -- 导入 / 导出 -------------------------------------------------------
     def preview_import_rows(self, rows, realm=None, overwrite=False):
         """报告 import_rows() 会做什么，不触碰账号池（Dry-Run）。"""
-        preview = {"added": [], "updated": [], "skipped": [], "invalid": []}
-        known = {a.uid for a in self.accounts}
-        seen = set()
-        for index, row in enumerate(rows):
-            try:
-                kwargs = normalise_import_row(row, realm=realm)
-            except Exception as exc:
-                preview["invalid"].append({"index": index + 1, "reason": str(exc)})
-                continue
-            uid = kwargs["uid"]
-            if uid in seen:
-                preview["skipped"].append({"uid": uid,
-                                           "reason": "duplicate inside the document"})
-            elif uid in known and not overwrite:
-                preview["skipped"].append({"uid": uid, "reason": "already exists"})
-            elif uid in known:
-                preview["updated"].append(uid)
-            else:
-                preview["added"].append(uid)
-            seen.add(uid)
-        return preview
+        return self._import_rows(rows, realm, overwrite, commit=False)
 
     def import_rows(self, rows, realm=None, overwrite=False):
-        """从导出/外部文档批量导入账号。
+        """逐行导入，返回四类结果及非阻断 warnings；覆盖前保存原文件。"""
+        return self._import_rows(rows, realm, overwrite, commit=True)
 
-        返回报告：added / updated / skipped / invalid。
-        一行解析失败不影响其余行；全部解析通过才写盘。
-        """
-        added, updated, skipped, invalid = [], [], [], []
+    def _import_rows(self, rows, realm, overwrite, commit):
+        report = {key: [] for key in ("added", "updated", "skipped", "invalid", "warnings")}
         seen = set()
         for index, row in enumerate(rows):
             try:
                 kwargs = normalise_import_row(row, realm=realm)
-            except Exception as exc:
-                invalid.append({"index": index + 1, "reason": str(exc)})
+            except (ValueError, TypeError) as exc:
+                report["invalid"].append({"index": index + 1, "reason": str(exc)})
                 continue
             uid = kwargs["uid"]
             if uid in seen:
-                skipped.append({"uid": uid,
-                                "reason": "duplicate inside the document"})
+                report["skipped"].append({"uid": uid, "reason": "duplicate inside the document"})
                 continue
             seen.add(uid)
-            existing = self.get(uid) is not None
-            if existing and not overwrite:
-                skipped.append({"uid": uid, "reason": "already exists"})
-                continue
-            try:
-                self.add(Account(kwargs))
-            except Exception as exc:
-                invalid.append({"index": index + 1, "reason": str(exc)})
-                continue
-            (updated if existing else added).append(uid)
-        return {
-            "added": added,
-            "updated": updated,
-            "skipped": skipped,
-            "invalid": invalid,
-        }
+            with self._lock:
+                existing = self.get(uid)
+                if existing and existing.realm != kwargs["realm"]:
+                    report["invalid"].append({"index": index + 1, "reason": "account uid belongs to a different realm"})
+                    continue
+                if existing and not overwrite:
+                    report["skipped"].append({"uid": uid, "reason": "already exists"})
+                    continue
+                if commit:
+                    try:
+                        if existing and existing.path:
+                            with existing._save_lock:
+                                backup_dir = Path(self.dir) / ".runtime" / "import-backups"
+                                backup_dir.mkdir(parents=True, exist_ok=True)
+                                backup = backup_dir / (uuid.uuid4().hex + ".json")
+                                backup.write_bytes(Path(existing.path).read_bytes())
+                        self.add(Account(kwargs))
+                    except Exception:
+                        report["invalid"].append({"index": index + 1, "reason": "account backup or save failed"})
+                        continue
+                report["updated" if existing else "added"].append(uid)
+                if "auth_user_info_raw" in row and kwargs["expiresAt"] <= time.time():
+                    report["warnings"].append({"index": index + 1, "uid": uid, "reason": "首次使用需刷新"})
+        return report
 
     # -- OAuth 设备授权登录 ------------------------------------------------
     @staticmethod
@@ -1468,6 +1683,7 @@ def _coerce_account_rows(blob):
             blob.get("accessToken")
             or isinstance(blob.get("auth"), dict)
             or isinstance(blob.get("account"), dict)
+            or "auth_user_info_raw" in blob
         )
         if not looks_like_account:
             keys = ", ".join(sorted(blob.keys())[:6]) or "none"
@@ -1487,8 +1703,49 @@ def _coerce_account_rows(blob):
     return out, ""
 
 
+def _adapt_cockpit_row(row, realm):
+    """Cockpit 纯转换：严格校验原始凭证，错误仅包含字段名。"""
+    if realm not in ("cn", "intl"):
+        raise ValueError("Cockpit requires explicit realm: cn or intl")
+    raw = row.get("auth_user_info_raw")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, RecursionError):
+            raise ValueError("auth_user_info_raw must be a JSON object") from None
+    if not isinstance(raw, dict):
+        raise ValueError("auth_user_info_raw must be a JSON object")
+
+    def text(value, field):
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError(field + " must be a string")
+        return value.strip()
+
+    token = text(raw.get("token"), "auth_user_info_raw.token")
+    if not token:
+        raise ValueError("auth_user_info_raw.token is required")
+    uid = text(raw.get("id"), "auth_user_info_raw.id") or text(row.get("user_id"), "user_id")
+    if not re.sub(r"[^A-Za-z0-9_-]", "_", uid).strip("_ "):
+        raise ValueError("auth_user_info_raw.id or user_id is required")
+    expires = normalize_epoch(raw.get("expireTime"))
+    if not expires:
+        raise ValueError("auth_user_info_raw.expireTime must be a finite positive epoch")
+    refresh = text(raw.get("refreshToken"), "auth_user_info_raw.refreshToken")
+    if expires <= time.time() and not refresh:
+        raise ValueError("expired Cockpit credential requires refreshToken")
+    return {"uid": uid, "accessToken": token, "refreshToken": refresh,
+            "nickname": text(raw.get("name"), "auth_user_info_raw.name") or text(row.get("display_name"), "display_name"),
+            "expiresAt": expires, "realm": realm, "domain": get_realm_config(realm)["domain"]}
+
+
 def normalise_import_row(row, realm=None):
     """把一行导入数据规整成 Account kwargs；无可用凭证时 raise ValueError。"""
+    if not isinstance(row, dict):
+        raise ValueError("account row must be an object")
+    if "auth_user_info_raw" in row:
+        row = _adapt_cockpit_row(row, realm)
     auth = row.get("auth") if isinstance(row.get("auth"), dict) else None
     profile = row.get("account") if isinstance(row.get("account"), dict) else None
 

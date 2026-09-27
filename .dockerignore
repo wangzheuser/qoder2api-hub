@@ -12,3 +12,9 @@ temp_*
 _acc
 _use
 .DS_Store
+
+# Local runtime data and verification artifacts
+accounts/
+usage/
+.omx/
+.env

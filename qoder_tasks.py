@@ -11,6 +11,7 @@
 5. 严格遵守 >= 1.0s 防风控间隔，并使用 qoder_fingerprint 的稳定设备指纹。
 """
 import time
+import urllib.parse
 
 import qoder_accounts
 from qoder_accounts import get_realm_config
@@ -143,10 +144,10 @@ def fetch_task_view(account):
     return tasks, summary
 
 
-def fetch_tasks_view(pool, realm=None, uid=None):
+def fetch_tasks_view(pool, realm=None, uid=None, credits_service=None):
     """看板 /tasks 聚合：选定账号的任务行 + 全部可签账号列表。
 
-    任务中心只列具备官方活动能力（has_checkin，即国内版）的账号。
+    日签到与通用活动分别门控；通用活动只在明细功能开启时按需查询。
     """
     if not pool or not pool.accounts:
         return {"tasks": [], "summary": {}, "accounts": [],
@@ -154,18 +155,53 @@ def fetch_tasks_view(pool, realm=None, uid=None):
     eligible = [a for a in pool.accounts
                 if a.enabled and a.access_token
                 and (not realm or a.realm == realm)
-                and get_realm_config(a.realm)["has_checkin"]]
+                and (get_realm_config(a.realm)["has_checkin"] or credits_service is not None)]
     if not eligible:
         return {"tasks": [], "summary": {}, "accounts": [],
-                "msg": "未找到可签到账号（签到与福利活动仅国内版开放）"}
+                "msg": "未找到可用的任务账号"}
     acc = None
     if uid and uid != "all":
         target = pool.get(uid)
         if target and target in eligible:
             acc = target
+        else:
+            return {"tasks": [], "summary": {}, "accounts": [], "msg": "指定账号不属于所选区域或已停用"}
     if acc is None:
         acc = eligible[0]
-    tasks, summary = fetch_task_view(acc)
+    if get_realm_config(acc.realm)["has_checkin"]:
+        tasks, summary = fetch_task_view(acc)
+    else:
+        tasks, summary = [], {"realm": acc.realm, "credits": acc.credits or {}, "plan": acc.plan}
+    summary["has_checkin"] = get_realm_config(acc.realm)["has_checkin"]
+    if credits_service is not None:
+        details = credits_service.details(acc)
+        summary["credits_details"] = details
+        for campaign in details.get("campaigns") or []:
+            campaign_id = campaign.get("campaignId")
+            if not campaign_id:
+                continue
+            status = campaign.get("claimStatus")
+            action = campaign.get("actionType")
+            now = time.time()
+            active = (not campaign.get("startAt") or campaign["startAt"] <= now) and (
+                not campaign.get("endAt") or now < campaign["endAt"])
+            claimable = (active and campaign.get("validity_valid", True)
+                         and status == "CLAIMABLE" and action == "CLAIM_BENEFIT"
+                         and details.get("endpoint_status", {}).get("campaigns", {}).get("status") == "supported")
+            url = str(campaign.get("url") or "")
+            try:
+                parsed = urllib.parse.urlsplit(url)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    url = ""
+            except ValueError:
+                url = ""
+            tasks.append({"task_code": "campaign:" + campaign_id, "campaign_id": campaign_id,
+                          "uid": acc.uid, "name": campaign.get("name") or campaign_id,
+                          "description": campaign.get("description") or "",
+                          "status": "claimed" if status == "CLAIMED" else "completed" if claimable else "not_accepted",
+                          "claimable": claimable, "action_type": action, "jump_url": url,
+                          "current": 1 if claimable or status == "CLAIMED" else 0,
+                          "target": 1, "reward_credit": 0, "reward_energy": 0})
     acct_list = [{"uid": a.uid, "nickname": a.nickname or a.uid[:8],
                   "realm": a.realm} for a in eligible]
     return {"tasks": tasks, "summary": summary, "account": acc.public(),

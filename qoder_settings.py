@@ -22,6 +22,55 @@ SESSION_TTL = 7 * 24 * 3600
 
 _lock = threading.RLock()
 
+GATEWAY_DEFAULTS = {
+    "queue_enabled": False,
+    "queue_max_wait_seconds": 120,
+    "pool_max_inflight": 0,
+    "usage_index_enabled": False,
+    "credits_details_enabled": False,
+}
+
+
+def validate_gateway(values):
+    """校验整个补丁后再写入，避免错误字段造成部分配置生效。"""
+    if not isinstance(values, dict):
+        raise ValueError("gateway must be an object")
+    for key, value in values.items():
+        if key not in GATEWAY_DEFAULTS:
+            raise ValueError("unknown gateway setting: " + key)
+        if isinstance(GATEWAY_DEFAULTS[key], bool):
+            if type(value) is not bool:
+                raise ValueError(key + " must be boolean")
+        else:
+            low, high = (1, 300) if key == "queue_max_wait_seconds" else (0, 16)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError("%s must be an integer in %d..%d" % (key, low, high))
+    return dict(values)
+
+
+def gateway_settings(accounts_dir):
+    result = dict(GATEWAY_DEFAULTS)
+    stored = load(accounts_dir).get("gateway")
+    if isinstance(stored, dict):
+        for key in result:
+            if key in stored:
+                try:
+                    result.update(validate_gateway({key: stored[key]}))
+                except ValueError:
+                    pass
+    return result
+
+
+def set_gateway(accounts_dir, values):
+    values = validate_gateway(values)
+    with _lock:
+        data = load(accounts_dir)
+        previous = data.get("gateway")
+        data["gateway"] = dict(previous) if isinstance(previous, dict) else {}
+        data["gateway"].update(values)
+        save(accounts_dir, data)
+    return gateway_settings(accounts_dir)
+
 
 def settings_path(accounts_dir):
     return os.path.join(accounts_dir, "settings.json")

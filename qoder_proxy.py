@@ -26,6 +26,8 @@ OpenAI 兼容接口。上游链路：
     python qoder_proxy.py --api-key sk-local  # require a bearer token
 """
 import argparse
+import copy
+import itertools
 import hashlib
 from collections import deque
 import re
@@ -44,6 +46,10 @@ import urllib.request
 import uuid
 
 import qoder_accounts
+import qoder_errors
+import qoder_queue
+import qoder_usage
+import qoder_credits
 import qoder_catalog
 import qoder_settings
 import qoder_sign
@@ -231,10 +237,11 @@ class BadJSON(Exception):
 class UpstreamStatus(Exception):
     """Raised when the upstream SSE envelope carries a non-200 status."""
 
-    def __init__(self, status, detail=""):
+    def __init__(self, status, detail="", info=None):
         super(UpstreamStatus, self).__init__("upstream status %s" % status)
         self.status = status
         self.detail = str(detail or "")
+        self.info = info or qoder_errors.classify(status, detail)
 
 
 # CORS is only needed by browser-based chat clients that call the OpenAI-style
@@ -331,6 +338,102 @@ def _empty_stats():
 
 
 _usage = _empty_stats()
+_usage_index = None
+_usage_index_lock = threading.Lock()
+_usage_summary_state = {"state": "not_checked"}
+
+
+def _get_usage_index():
+    global _usage_index
+    enabled = qoder_settings.gateway_settings(ACCOUNTS_DIR)["usage_index_enabled"]
+    with _usage_index_lock:
+        if _usage_index is not None and (
+                not enabled or str(_usage_index.source_path) != str(Path(USAGE_LOG).resolve())):
+            _usage_index.close()
+            _usage_index = None
+        if enabled and _usage_index is None:
+            _usage_index = qoder_usage.UsageIndex(USAGE_LOG).start()
+        return _usage_index
+
+
+def usage_index_status():
+    index = _get_usage_index()
+    result = index.status() if index else {"state": "disabled"}
+    return dict(result, summary=_usage_summary_state,
+                persist_errors=_usage.get("usage_persist_errors", 0))
+
+
+def _usage_watermark():
+    with _lock:
+        return qoder_usage.capture_watermark(USAGE_LOG)
+
+
+def _usage_rows(realm=None, limit=None, newest=False):
+    index = _get_usage_index()
+    watermark = _usage_watermark()
+    rows = index.snapshot_rows(watermark, realm=realm, limit=limit, newest=newest) if index else None
+    return rows if rows is not None else qoder_usage.scan_rows(
+        USAGE_LOG, watermark, realm=realm, limit=limit, newest=newest)
+
+
+def _accumulate_usage(stats, row):
+    outcome = row.get("outcome") or ("failed" if row.get("error") else "success")
+    if outcome == "client_aborted":
+        stats["client_aborted_requests"] = stats.get("client_aborted_requests", 0) + 1
+    elif row.get("error"):
+        stats["errors"] += 1
+    else:
+        stats["requests"] += 1
+        if row.get("usage_missing"):
+            stats["unknown_usage_requests"] = stats.get("unknown_usage_requests", 0) + 1
+        per = stats["by_model"].setdefault(
+            row.get("model") or "unknown", {"requests": 0, **{k: 0 for k in USAGE_FIELDS}})
+        per["requests"] += 1
+        for key in USAGE_FIELDS:
+            value = row.get(key) or 0
+            stats[key] += value
+            per[key] += value
+        for name in ("ttft", "gen"):
+            value = row.get(name + "_ms")
+            if value is not None:
+                stats[name + "_ms_sum"] += value
+                stats[name + "_samples"] += 1
+    if row.get("elapsed_ms") is not None:
+        stats["wall_ms_sum"] += row["elapsed_ms"]
+        stats["wall_samples"] += 1
+
+
+def load_usage_summary():
+    """保留不可重建的历史总计；完整日志领先时恢复兼容 summary。"""
+    global _usage_summary_state
+    rebuilt = _empty_stats()
+    for row in qoder_usage.scan_rows(USAGE_LOG, _usage_watermark()):
+        _accumulate_usage(rebuilt, row)
+    try:
+        saved = json.loads(Path(USAGE_SUMMARY).read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            raise ValueError("summary must be an object")
+    except (OSError, ValueError):
+        saved = {}
+    keys = ("requests", "errors", "unknown_usage_requests", "client_aborted_requests",
+            "ttft_ms_sum", "gen_ms_sum", "wall_ms_sum") + USAGE_FIELDS
+    older_history = any((saved.get(k) or 0) > (rebuilt.get(k) or 0) for k in keys)
+    same = all((saved.get(k) or 0) == (rebuilt.get(k) or 0) for k in keys)
+    _usage_summary_state = {"state": "historical_difference" if older_history else "consistent" if same else "rebuilt",
+                            "saved_requests": saved.get("requests", 0),
+                            "log_requests": rebuilt["requests"]}
+    with _lock:
+        _usage.clear()
+        _usage.update(_empty_stats())
+        _usage.update(saved if older_history or same else rebuilt)
+        if not older_history and not same:
+            path = Path(USAGE_SUMMARY)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+            tmp.write_text(json.dumps(_usage, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+    if not same:
+        log("usage summary: " + _usage_summary_state["state"], tag="usage")
 
 
 def _extract_usage(usage):
@@ -351,28 +454,27 @@ def _extract_usage(usage):
 
 
 def row_matches_realm(row, realm):
-    if not realm:
-        return True
-    r = row.get("realm")
-    if r:
-        return r == realm
-    acct_uid = row.get("account")
-    if acct_uid and POOL:
-        acc = POOL.get(acct_uid)
-        if acc:
-            return acc.realm == realm
-    model = row.get("model")
-    if model:
-        return detect_model_realm(model) == realm
-    return realm == "cn"
+    return not realm or (row.get("realm") or "unknown") == realm
+
+
+def _usage_context(row, account=None, realm=None, ctx=None):
+    if ctx is not None:
+        account = ctx.account.uid if ctx.account else account
+        realm = ctx.realm
+        row.update(request_id=ctx.request_id,
+                   queue_wait_ms=round(ctx.queue_wait_seconds * 1000))
+    if account:
+        row["account"] = account
+    acc = POOL.get(account) if account and POOL else None
+    row["realm"] = realm or (acc.realm if acc else "unknown")
 
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
-                 gen_ms=None, fp=None, account=None):
+                 gen_ms=None, fp=None, account=None, realm=None, ctx=None):
     """Accumulate stats, append a JSONL row, and persist the summary."""
     fields = _extract_usage(usage)
-    if not fields:
-        return None
+    missing = not fields
+    fields = fields or {k: 0 for k in USAGE_FIELDS}
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -381,14 +483,14 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         "elapsed_ms": elapsed_ms,
         "ttft_ms": ttft_ms,
         "gen_ms": gen_ms,
+        "status": "success",
+        "outcome": "success",
+        "usage_missing": missing,
     }
     row.update(fields)
     if fp:
         row.update(fp)
-    if account:
-        row["account"] = account
-    acc = POOL.get(account) if (account and POOL) else None
-    row["realm"] = acc.realm if acc else CURRENT_REALM
+    _usage_context(row, account, realm, ctx)
     if gen_ms and gen_ms > 0:
         row["tokens_per_sec"] = round(
             fields["completion_tokens"] / (gen_ms / 1000.0), 2)
@@ -396,27 +498,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         row["cache_hit_pct"] = round(
             fields["cached_tokens"] * 100.0 / fields["prompt_tokens"], 1)
     with _lock:
-        _usage["requests"] += 1
-        for k in USAGE_FIELDS:
-            if k in fields:
-                _usage[k] += fields[k]
-        if ttft_ms is not None:
-            _usage["ttft_ms_sum"] += ttft_ms
-            _usage["ttft_samples"] += 1
-        if gen_ms is not None:
-            _usage["gen_ms_sum"] += gen_ms
-            _usage["gen_samples"] += 1
-        if elapsed_ms is not None:
-            _usage["wall_ms_sum"] += elapsed_ms
-            _usage["wall_samples"] += 1
-        per = _usage["by_model"].setdefault(
-            model, {"requests": 0, **{k: 0 for k in USAGE_FIELDS}})
-        per["requests"] += 1
-        for k in USAGE_FIELDS:
-            if k in fields:
-                per[k] += fields[k]
+        _accumulate_usage(_usage, row)
         summary = json.loads(json.dumps(_usage))
-    _persist_usage(row, summary, "usage persist failed")
+        _persist_usage(row, summary, "usage persist failed")
     try:
         t_tokens = fields.get("total_tokens", 0)
         dur = " %dms" % elapsed_ms if elapsed_ms is not None else ""
@@ -446,8 +530,18 @@ def _persist_usage(row, summary, fail_label):
         if not (log_path.is_relative_to(usage_dir)
                 and summary_path.is_relative_to(usage_dir)):
             raise ValueError("usage path escapes base directory")
-        with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with open(log_path, "ab+") as fh:
+            # 崩溃留下的半行单独成为坏行，不能吞掉下一条完整记录。
+            fh.seek(0, os.SEEK_END)
+            end = fh.tell()
+            if end:
+                fh.seek(end - 1)
+                if fh.read(1) != b"\n":
+                    fh.write(b"\n")
+            fh.write((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
+            fh.flush()
+        if _usage_index is not None:
+            _usage_index.notify()
         tmp_summary = usage_dir / (
             os.path.basename(USAGE_SUMMARY)
             + ".%d.%d.tmp" % (os.getpid(), threading.get_ident()))
@@ -464,28 +558,32 @@ def _persist_usage(row, summary, fail_label):
                 pass
             raise
     except Exception as exc:
+        _usage["usage_persist_errors"] = _usage.get("usage_persist_errors", 0) + 1
         log("%s: %s" % (fail_label, exc))
 
 
-def record_error(model, status, message, elapsed_ms=None):
+def record_error(model, status, message, elapsed_ms=None, ctx=None, realm=None,
+                 account=None, usage=None, outcome="failed", stream=None):
     """Count a failed request and append it to the log so errors are visible."""
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": model,
         "error": True,
-        "status": status,
+        "status": "client_aborted" if outcome == "client_aborted" else status,
         # 保留更完整的上游错误（provider_error 的内层 details 常在 200+ 字节）
         "message": str(message)[:400],
         "elapsed_ms": elapsed_ms,
+        "outcome": outcome,
+        "stream": bool(stream),
+        "usage_missing": not bool(usage),
     }
+    row.update(_extract_usage(usage))
+    _usage_context(row, account, realm, ctx)
     with _lock:
-        _usage["errors"] += 1
-        if elapsed_ms is not None:
-            _usage["wall_ms_sum"] += elapsed_ms
-            _usage["wall_samples"] += 1
+        _accumulate_usage(_usage, row)
         summary = json.loads(json.dumps(_usage))
-    _persist_usage(row, summary, "error persist failed")
+        _persist_usage(row, summary, "error persist failed")
     dur = " %dms" % elapsed_ms if elapsed_ms is not None else ""
     log("request error: model=%s%s status=%s msg=%s"
         % (model, dur, status, str(message)[:360]),
@@ -530,16 +628,7 @@ def _perf_stats_uncached(sample=5000, realm=None):
     ttfts, gens, walls, rates, hits, tok_rates = [], [], [], [], [], []
     total = ok = err = 0
     m_buckets = {}
-    # 只读日志末尾 sample 行：readlines() 会把整个日志读成字符串列表。
-    rows = [raw.decode("utf-8", "replace") for raw in _tail_lines(USAGE_LOG, sample)]
-    for line in rows:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
+    for r in _usage_rows(limit=sample, newest=True):
         if realm and not row_matches_realm(r, realm):
             continue
         total += 1
@@ -641,46 +730,41 @@ def _usage_snapshot_uncached(realm=None):
     snap = _empty_stats()
     snap["started"] = _usage.get("started", time.time())
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if r and not row_matches_realm(row, r):
-                    continue
-                if row.get("error"):
-                    snap["errors"] += 1
-                else:
-                    snap["requests"] += 1
-                    for k in USAGE_FIELDS:
-                        if k in row:
-                            snap[k] += (row[k] or 0)
-                    m = row.get("model") or "unknown"
-                    per = snap["by_model"].setdefault(
-                        m, {"requests": 0, "accounts": {},
-                            **{k: 0 for k in USAGE_FIELDS}})
-                    per["requests"] += 1
-                    for k in USAGE_FIELDS:
-                        if k in row:
-                            per[k] += (row[k] or 0)
-                    acct_id = row.get("account")
-                    if acct_id:
-                        per.setdefault("accounts", {})
-                        per["accounts"][acct_id] = per["accounts"].get(acct_id, 0) + 1
+        for row in _usage_rows():
+            if r and not row_matches_realm(row, r):
+                continue
+            if row.get("outcome") == "client_aborted":
+                snap["client_aborted_requests"] = snap.get("client_aborted_requests", 0) + 1
+                continue
+            if row.get("error"):
+                snap["errors"] += 1
+            else:
+                snap["requests"] += 1
+                for k in USAGE_FIELDS:
+                    if k in row:
+                        snap[k] += (row[k] or 0)
+                m = row.get("model") or "unknown"
+                per = snap["by_model"].setdefault(
+                    m, {"requests": 0, "accounts": {},
+                        **{k: 0 for k in USAGE_FIELDS}})
+                per["requests"] += 1
+                for k in USAGE_FIELDS:
+                    if k in row:
+                        per[k] += (row[k] or 0)
+                acct_id = row.get("account")
+                if acct_id:
+                    per.setdefault("accounts", {})
+                    per["accounts"][acct_id] = per["accounts"].get(acct_id, 0) + 1
     except FileNotFoundError:
         pass
     except Exception as exc:
         log("usage snapshot read failed: %s" % exc)
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S",
-                                  time.localtime(snap.get("started", time.time())))
+                              time.localtime(snap.get("started", time.time())))
     snap["log_file"] = USAGE_LOG
     snap["realm"] = r
     snap["accounts_map"] = {a.uid: {"nickname": a.nickname, "realm": a.realm}
-                            for a in POOL.accounts} if POOL else {}
+                        for a in POOL.accounts} if POOL else {}
     snap["account"] = {
         "uid": (rep.uid if rep else ""),
         "domain": (rep.domain if rep else ""),
@@ -693,135 +777,34 @@ def _usage_snapshot_uncached(realm=None):
     return snap
 
 
-def _tail_lines(path, max_lines, chunk=256 * 1024):
-    """Return up to the last `max_lines` non-empty lines, oldest first.
-
-    The usage log passes 20MB within a day. Scanning it end to end on every
-    dashboard poll was the dominant cost behind slow /usage/* responses.
-    """
-    lines = []
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            pos = fh.tell()
-            buf = b""
-            while pos > 0 and len(lines) < max_lines:
-                step = min(chunk, pos)
-                pos -= step
-                fh.seek(pos)
-                buf = fh.read(step) + buf
-                parts = buf.split(b"\n")
-                buf = parts[0]
-                for raw in reversed(parts[1:]):
-                    if not raw.strip():
-                        continue
-                    lines.append(raw)
-                    if len(lines) >= max_lines:
-                        break
-            if len(lines) < max_lines and buf.strip():
-                lines.append(buf)
-    except FileNotFoundError:
-        return []
-    except Exception as exc:
-        log("tail read failed: %s" % exc)
-        return []
-    lines.reverse()
-    return lines
-
-
 def count_usage_rows(realm=None):
-    """Cheap row count - substring match instead of a full JSON parse."""
-    needles = ()
-    if realm:
-        needles = ('"realm": "%s"' % realm, '"realm":"%s"' % realm)
-    n = 0
-    try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                if not needles:
-                    n += 1
-                    continue
-                if any(x in line for x in needles):
-                    n += 1
-                    continue
-                if '"realm"' in line:
-                    continue
-                try:
-                    if row_matches_realm(json.loads(line), realm):
-                        n += 1
-                except Exception:
-                    pass
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-    return n
+    index = _get_usage_index()
+    watermark = _usage_watermark()
+    count = index.count(watermark, realm=realm) if index else None
+    return count if count is not None else len(qoder_usage.scan_rows(USAGE_LOG, watermark, realm=realm))
 
 
 def recent_usage(limit=100, realm=None, page=1):
-    """Paginated rows from the tail of the log (page 1 is latest)."""
+    """总数和分页使用同一次已完成日志水位。"""
     try:
         limit = max(1, int(limit))
-    except Exception:
+    except (ValueError, TypeError):
         limit = 100
     try:
         page = max(1, int(page))
-    except Exception:
+    except (ValueError, TypeError):
         page = 1
-    total = count_usage_rows(realm)
-    total_pages = max(1, (total + limit - 1) // limit) if total > 0 else 1
+    index = _get_usage_index()
+    watermark = _usage_watermark()
+    result = index.recent(watermark, limit=limit, page=page, realm=realm) if index else None
+    if result is not None:
+        return result
+    rows = qoder_usage.scan_rows(USAGE_LOG, watermark, realm=realm, newest=True)
+    total = len(rows)
+    total_pages = max(1, (total + limit - 1) // limit)
     page = min(page, total_pages)
-    target_count = page * limit
-    matching = []
-    chunk = 256 * 1024
-    try:
-        with open(USAGE_LOG, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            pos = fh.tell()
-            buf = b""
-            while pos > 0 and len(matching) < target_count:
-                step = min(chunk, pos)
-                pos -= step
-                fh.seek(pos)
-                buf = fh.read(step) + buf
-                parts = buf.split(b"\n")
-                buf = parts[0]
-                for raw in reversed(parts[1:]):
-                    st = raw.strip()
-                    if not st:
-                        continue
-                    try:
-                        item = json.loads(st.decode("utf-8", "replace"))
-                    except Exception:
-                        continue
-                    if realm and not row_matches_realm(item, realm):
-                        continue
-                    matching.append(item)
-                    if len(matching) >= target_count:
-                        break
-            if len(matching) < target_count and buf.strip():
-                try:
-                    item = json.loads(buf.strip().decode("utf-8", "replace"))
-                    if not realm or row_matches_realm(item, realm):
-                        matching.append(item)
-                except Exception:
-                    pass
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        log("recent_usage read failed: %s" % exc)
-    start_idx = (page - 1) * limit
-    end_idx = start_idx + limit
-    page_rows = matching[start_idx:end_idx]
-    return {
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "total_pages": total_pages,
-        "rows": page_rows,
-    }
+    return {"total": total, "page": page, "limit": limit,
+            "total_pages": total_pages, "rows": rows[(page - 1) * limit:page * limit]}
 
 
 POOL = None
@@ -874,7 +857,12 @@ def account_views(realm=None):
     """List view of every account, including a live readiness flag."""
     if not POOL:
         return []
-    return POOL.list_public(realm=realm)
+    rows = POOL.list_public(realm=realm)
+    for row in rows:
+        account = POOL.get(row["uid"])
+        if account is not None:
+            row["credits_details"] = qoder_credits.SERVICE.cached(account)
+    return rows
 
 
 _byacct_cache = {"at": 0.0, "data": None}
@@ -896,32 +884,29 @@ def usage_by_account(ttl=10):
 
 def _usage_by_account_uncached():
     """Aggregate the JSONL log per account id."""
+    index = _get_usage_index()
+    watermark = _usage_watermark()
+    result = index.by_account(watermark) if index else None
+    if result is not None:
+        return result
     buckets = {}
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if row.get("error"):
-                    continue
-                key = row.get("account") or "(unattributed)"
-                bucket = buckets.setdefault(key, {
-                    "account": key, "requests": 0, "prompt_tokens": 0,
-                    "completion_tokens": 0, "reasoning_tokens": 0,
-                    "cached_tokens": 0, "total_tokens": 0, "models": {},
-                })
-                bucket["requests"] += 1
-                for field in ("prompt_tokens", "completion_tokens",
-                              "reasoning_tokens", "cached_tokens",
-                              "total_tokens"):
-                    bucket[field] += row.get(field) or 0
-                model = row.get("model") or "?"
-                bucket["models"][model] = bucket["models"].get(model, 0) + 1
+        for row in qoder_usage.scan_rows(USAGE_LOG, watermark):
+            if row.get("error"):
+                continue
+            key = row.get("account") or "(unattributed)"
+            bucket = buckets.setdefault(key, {
+                "account": key, "requests": 0, "prompt_tokens": 0,
+                "completion_tokens": 0, "reasoning_tokens": 0,
+                "cached_tokens": 0, "total_tokens": 0, "models": {},
+            })
+            bucket["requests"] += 1
+            for field in ("prompt_tokens", "completion_tokens",
+                          "reasoning_tokens", "cached_tokens",
+                          "total_tokens"):
+                bucket[field] += row.get(field) or 0
+            model = row.get("model") or "?"
+            bucket["models"][model] = bucket["models"].get(model, 0) + 1
     except FileNotFoundError:
         pass
     except Exception as exc:
@@ -953,76 +938,71 @@ def compute_usage_analytics():
     model_map = {}
     if os.path.exists(USAGE_LOG):
         try:
-            with open(USAGE_LOG, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                    except Exception:
-                        continue
-                    is_err = bool(r.get("error"))
-                    at = r.get("at", 0)
-                    is_today = (at >= today_ts)
-                    acct_uid = r.get("account") or "(unattributed)"
-                    m_id = r.get("model") or "(unknown)"
+            for r in _usage_rows():
+                is_err = bool(r.get("error"))
+                at = r.get("at", 0)
+                is_today = (at >= today_ts)
+                acct_uid = r.get("account") or "(unattributed)"
+                m_id = r.get("model") or "(unknown)"
 
-                    def feed(stat_obj, is_error):
-                        if is_error:
-                            stat_obj["errors"] += 1
-                        else:
-                            stat_obj["requests"] += 1
-                            stat_obj["prompt_tokens"] += (r.get("prompt_tokens") or 0)
-                            stat_obj["completion_tokens"] += (r.get("completion_tokens") or 0)
-                            stat_obj["reasoning_tokens"] += (r.get("reasoning_tokens") or 0)
-                            stat_obj["cached_tokens"] += (r.get("cached_tokens") or 0)
-                            stat_obj["total_tokens"] += (r.get("total_tokens") or 0)
-                            if r.get("ttft_ms"):
-                                stat_obj["ttft_sum"] += r["ttft_ms"]
-                                stat_obj["ttft_n"] += 1
-                            if r.get("tokens_per_sec"):
-                                stat_obj["speed_sum"] += r["tokens_per_sec"]
-                                stat_obj["speed_n"] += 1
-                            if r.get("elapsed_ms"):
-                                stat_obj["elapsed_sum"] += r["elapsed_ms"]
-                                stat_obj["elapsed_n"] += 1
+                def feed(stat_obj, is_error):
+                    if r.get("outcome") == "client_aborted":
+                        stat_obj["client_aborted_requests"] = stat_obj.get("client_aborted_requests", 0) + 1
+                        return
+                    if is_error:
+                        stat_obj["errors"] += 1
+                    else:
+                        stat_obj["requests"] += 1
+                        stat_obj["prompt_tokens"] += (r.get("prompt_tokens") or 0)
+                        stat_obj["completion_tokens"] += (r.get("completion_tokens") or 0)
+                        stat_obj["reasoning_tokens"] += (r.get("reasoning_tokens") or 0)
+                        stat_obj["cached_tokens"] += (r.get("cached_tokens") or 0)
+                        stat_obj["total_tokens"] += (r.get("total_tokens") or 0)
+                        if r.get("ttft_ms"):
+                            stat_obj["ttft_sum"] += r["ttft_ms"]
+                            stat_obj["ttft_n"] += 1
+                        if r.get("tokens_per_sec"):
+                            stat_obj["speed_sum"] += r["tokens_per_sec"]
+                            stat_obj["speed_n"] += 1
+                        if r.get("elapsed_ms"):
+                            stat_obj["elapsed_sum"] += r["elapsed_ms"]
+                            stat_obj["elapsed_n"] += 1
 
-                    feed(all_summary, is_err)
+                feed(all_summary, is_err)
+                if is_today:
+                    feed(today_summary, is_err)
+                if acct_uid not in acct_map:
+                    acct_map[acct_uid] = {
+                        "uid": acct_uid,
+                        "nickname": acct_uid,
+                        "realm": r.get("realm", ""),
+                        "domain": "",
+                        "today": new_stat(),
+                        "all_time": new_stat(),
+                        "today_models": {},
+                        "all_models": {},
+                    }
+                feed(acct_map[acct_uid]["all_time"], is_err)
+                if is_today:
+                    feed(acct_map[acct_uid]["today"], is_err)
+                if not is_err:
+                    tm = acct_map[acct_uid]["all_models"].setdefault(
+                        m_id, {"requests": 0, "tokens": 0, "reasoning": 0})
+                    tm["requests"] += 1
+                    tm["tokens"] += (r.get("total_tokens") or 0)
+                    tm["reasoning"] += (r.get("reasoning_tokens") or 0)
                     if is_today:
-                        feed(today_summary, is_err)
-                    if acct_uid not in acct_map:
-                        acct_map[acct_uid] = {
-                            "uid": acct_uid,
-                            "nickname": acct_uid,
-                            "realm": r.get("realm", ""),
-                            "domain": "",
-                            "today": new_stat(),
-                            "all_time": new_stat(),
-                            "today_models": {},
-                            "all_models": {},
-                        }
-                    feed(acct_map[acct_uid]["all_time"], is_err)
-                    if is_today:
-                        feed(acct_map[acct_uid]["today"], is_err)
-                    if not is_err:
-                        tm = acct_map[acct_uid]["all_models"].setdefault(
+                        tdm = acct_map[acct_uid]["today_models"].setdefault(
                             m_id, {"requests": 0, "tokens": 0, "reasoning": 0})
-                        tm["requests"] += 1
-                        tm["tokens"] += (r.get("total_tokens") or 0)
-                        tm["reasoning"] += (r.get("reasoning_tokens") or 0)
-                        if is_today:
-                            tdm = acct_map[acct_uid]["today_models"].setdefault(
-                                m_id, {"requests": 0, "tokens": 0, "reasoning": 0})
-                            tdm["requests"] += 1
-                            tdm["tokens"] += (r.get("total_tokens") or 0)
-                            tdm["reasoning"] += (r.get("reasoning_tokens") or 0)
-                    if m_id not in model_map:
-                        model_map[m_id] = {"model": m_id, "today": new_stat(),
-                                           "all_time": new_stat()}
-                    feed(model_map[m_id]["all_time"], is_err)
-                    if is_today:
-                        feed(model_map[m_id]["today"], is_err)
+                        tdm["requests"] += 1
+                        tdm["tokens"] += (r.get("total_tokens") or 0)
+                        tdm["reasoning"] += (r.get("reasoning_tokens") or 0)
+                if m_id not in model_map:
+                    model_map[m_id] = {"model": m_id, "today": new_stat(),
+                                       "all_time": new_stat()}
+                feed(model_map[m_id]["all_time"], is_err)
+                if is_today:
+                    feed(model_map[m_id]["today"], is_err)
         except Exception as exc:
             log("compute_usage_analytics failed: %s" % exc)
     if POOL:
@@ -1113,6 +1093,8 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
+        "gateway": qoder_settings.gateway_settings(ACCOUNTS_DIR),
+        "usage_index": usage_index_status(),
         "version": VERSION,
     }
 
@@ -2090,7 +2072,7 @@ def flatten_messages(messages):
     return system_text, flat, images
 
 
-def build_qoder_body(payload, account, model_key, realm=None):
+def build_qoder_body(payload, account, model_key, realm=None, ids=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
     以官方 baseprompt.json 为骨架：每次覆写 request/session id、时间戳、
@@ -2133,6 +2115,8 @@ def build_qoder_body(payload, account, model_key, realm=None):
     body["chat_record_id"] = nid
     body["request_set_id"] = str(uuid.uuid4())
     body["session_id"] = str(uuid.uuid4())
+    if ids is not None:
+        body.update(ids)
     body["stream"] = True
     body["agent_id"] = "agent_common"
     body["aliyun_user_type"] = getattr(account, "user_type", "") or \
@@ -2216,15 +2200,6 @@ def build_qoder_body(payload, account, model_key, realm=None):
 # ---------------------------------------------------------------------------
 # Qoder 数据面：上游打开与 SSE 信封解包
 # ---------------------------------------------------------------------------
-class RateLimited(Exception):
-    """Upstream throttled this request (429 / 频控)。"""
-
-    def __init__(self, http_error=None, detail="", wait=60):
-        self.http_error = http_error
-        self.detail = detail or ""
-        self.wait = max(1, int(wait or 60))
-        super(RateLimited, self).__init__(
-            "upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
 # 账号级错误短冷却的“等待续上”上限：单账号池在传输/瞬时故障后只有
@@ -2306,32 +2281,7 @@ def extract_session_key(headers, payload):
 
 
 # 上游瞬时故障（与客户端参数无关，值得同账号快速重试）
-TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
-_CLIENT_FAULT_MARKERS = (
-    "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
-    "invalid_request_error",
-    "authentication_error",
-    "permission_error",
-    '"Range of ',
-    # 上游内容安全审核：确定性拒绝，重试无效（本轮日志实证
-    # InternalError.Algo.DataInspectionFailed: Input text data may contain
-    # inappropriate content.）
-    "DataInspectionFailed",
-    "inappropriate content",
-    "input text data may contain",
-    "ContentFilter",
-    "SensitiveContent",
-)
-
-# 内容审核类错误（用户输入侧问题，需专门的中文解释）
-_CONTENT_POLICY_MARKERS = (
-    "DataInspectionFailed",
-    "inappropriate content",
-    "input text data may contain",
-    "ContentFilter",
-    "SensitiveContent",
-)
 
 
 def _is_transient_upstream(code, detail):
@@ -2341,16 +2291,7 @@ def _is_transient_upstream(code, detail):
     - 418（上游把自己的 provider 故障包装成 418+provider_error）与 5xx → 瞬时
     - 其余 4xx 带 provider_error（"Error in upstream response"）→ 瞬时
     """
-    detail = detail or ""
-    if code in (401, 403, 429):
-        return False        # 凭证/频控各自有专门处理路径，不属瞬时重试类
-    if any(m in detail for m in _CLIENT_FAULT_MARKERS):
-        return False
-    if code in TRANSIENT_HTTP_CODES or code >= 500:
-        return True
-    if 400 <= code < 500 and "provider_error" in detail:
-        return True
-    return False
+    return qoder_errors.classify(code, detail).kind == "transient"
 
 
 def _is_transient_transport(exc):
@@ -2372,7 +2313,7 @@ def _is_transient_transport(exc):
     return False
 
 
-def friendly_upstream_error(code, detail):
+def friendly_upstream_error(code, detail, info=None, retried=False):
     """把上游错误转成对客户端可读的消息；瞬时故障给出重试指引。
 
     返回 (message, err_type)。
@@ -2383,320 +2324,254 @@ def friendly_upstream_error(code, detail):
     except Exception:
         code_i = 502
     # 1) 上游内容安全审核（确定性拒绝，先于瞬时判断——重试无效）
-    if any(m in detail for m in _CONTENT_POLICY_MARKERS):
+    info = info or qoder_errors.classify(code_i, detail)
+    if info.kind == "content":
         return ("上游内容安全审核未通过 (DataInspectionFailed)：输入可能含不当内容，"
                 "属确定性拒绝、重试无效。请检查/缩短输入（系统提示词、超长历史、"
                 "工具定义或粘贴的代码/文本）后重试。上游详情：%s"
                 % detail[:300],
                 "content_policy_rejected")
-    if _is_transient_upstream(code_i, detail) or (
-            "provider_error" in detail and "invalid_" not in detail):
-        return ("上游瞬时故障 (HTTP %s)：网关已对同账号自动重试仍失败，"
+    if info.kind == "transient":
+        return ("上游瞬时故障 (HTTP %s)：%s"
                 "请稍后重试。上游详情：%s"
-                % (code_i, detail[:300] or "(无详情)"),
+                % (code_i, "网关自动恢复后仍失败，" if retried else "", detail[:300] or "(无详情)"),
                 "upstream_transient_error")
-    return ("upstream %s: %s" % (code_i, detail)), "upstream_error"
+    error_type = "upstream_error" if info.kind == "request" else qoder_errors.public_error_type(info)
+    return ("upstream %s: %s" % (code_i, detail)), error_type
 
 
-def _to_int_status(status):
-    """信封 statusCodeValue 可能是 int 或 str，统一成 int（失败回 502）。"""
-    try:
-        return int(status)
-    except Exception:
-        return 502
+class RequestContext:
+    """一个客户端请求的恢复预算与资源所有者。"""
+    def __init__(self, payload, realm, session_key=None, options=None, on_wait=None, account_uid=None):
+        self.payload = copy.deepcopy(payload)
+        self.realm = realm
+        self.model = str(payload.get("model") or "auto")
+        self.model_key = qoder_catalog.resolve_upstream_key(self.model, realm=realm)
+        self.session_key = session_key or derive_affinity_key(payload.get("messages") or [])
+        self.options = dict(qoder_settings.GATEWAY_DEFAULTS)
+        self.options.update(options or {})
+        self.on_wait = on_wait
+        self.request_id = uuid.uuid4().hex
+        self.started = time.monotonic()
+        self.first_token_ms = None
+        self.account = None
+        self.account_uid = account_uid
+        self.response = None
+        self.ids = None
+        self.encoded = None
+        self.body = None
+        self.tried = set()
+        self.attempts = 0
+        self.retries = 0
+        self.queue_wait_seconds = 0.0
+        self.queue_recoveries = 0
+        self.business_started = False
+        self.lease = None
+        self.waited_cooldown = False
 
+    def close_response(self):
+        response, self.response = self.response, None
+        if response is not None:
+            response.close()
 
-def should_retry_envelope(exc, emitted_bytes, attempt):
-    """流内错误信封是否值得**重开上游**再试。
+    def close(self):
+        try:
+            self.close_response()
+        finally:
+            if self.lease is not None:
+                self.lease.release()
+                self.lease = None
 
-    关键前提（access log 记 200 而业务错 418 的根因）：上游先以 HTTP200
-    建流，provider 故障以 SSE 信封 statusCodeValue=418 投递——此时 urlopen
-    层重试覆盖不到。只要 **尚未向客户端发出任何字节**、未超预算、且错误属
-    瞬时类（418/5xx/provider_error，且非客户端参数错），就值得重开。
-    """
-    if emitted_bytes:
-        return False
-    if attempt >= TRANSIENT_MAX_RETRIES:
-        return False
-    return _is_transient_upstream(_to_int_status(getattr(exc, "status", 502)),
-                                  getattr(exc, "detail", "") or "")
-
-
-def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
-                                  holder, account):
-    """非流式：流内瞬时错误信封 / 传输抖动 -> 重开上游重新聚合。
-
-    仅用于客户端尚未收到任何字节的非流式路径。返回 (chat_obj, account)：
-      - 最终信封错误以 UpstreamStatus 抛出（调用方既有分支处理：记账+友好提示）
-      - 重开时 open_upstream 的 RateLimited/HTTPError 记日志后仍以**原信封**
-        错误上抛（原错误才是本次请求的真实结果，且其分支已具备友好映射）
-      - 传输层瞬时错误（TLS EOF 等）同样触发重开
-    传入的 resp 由调用方的 with/finally 关闭；本函数只负责关闭重开的新连接。
-    """
-    cur = resp
-    try:
-        for attempt in range(TRANSIENT_MAX_RETRIES + 1):
-            try:
-                obj = aggregate_stream(cur, model, None, holder=holder)
-                return obj, account
-            except UpstreamStatus as exc:
-                if attempt >= TRANSIENT_MAX_RETRIES or not _is_transient_upstream(
-                        _to_int_status(exc.status), exc.detail or ""):
-                    raise
-                log("in-stream envelope status %s on model '%s' "
-                    "(try %d/%d), reopening upstream"
-                    % (exc.status, model, attempt + 1,
-                       TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
-                time.sleep(attempt + 1)
-                try:
-                    new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
-                except Exception as reopen_exc:
-                    log("reopen after envelope error failed: %s"
-                        % str(reopen_exc)[:160], level="WARN", tag="chat")
-                    raise exc      # 以原信封错误进入既有处理路径
-                if cur is not resp:
-                    try:
-                        cur.close()
-                    except Exception:
-                        pass
-                cur = new_resp
-            except Exception as exc:
-                if attempt >= TRANSIENT_MAX_RETRIES or \
-                        not _is_transient_transport(exc):
-                    raise
-                log("in-stream transport error on model '%s' (try %d/%d): "
-                    "%s - reopening upstream"
-                    % (model, attempt + 1, TRANSIENT_MAX_RETRIES + 1,
-                       str(exc)[:120]), level="WARN", tag="chat")
-                time.sleep(attempt + 1)
-                try:
-                    new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
-                except Exception as reopen_exc:
-                    log("reopen after transport error failed: %s"
-                        % str(reopen_exc)[:160], level="WARN", tag="chat")
-                    raise exc
-                if cur is not resp:
-                    try:
-                        cur.close()
-                    except Exception:
-                        pass
-                cur = new_resp
-    finally:
-        if cur is not resp:
-            try:
-                cur.close()
-            except Exception:
-                pass
-
-
-def open_upstream(payload, session_key=None, target_realm=None):
-    """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
-
-    账号轮换规则：
-      - 401/403：凭证被拒 -> 冷却该账号（单账号池时短冷却）换号
-      - 429    ：模型粒度频控 -> 解析 reset 时间做模型冷却换号
-      - 418/5xx/provider_error（瞬时上游故障）-> 同账号快速重试 2 次
-                （1s/2s 退避），仍失败短冷却(15s/单账号3s)换号
-      - 其他 4xx（含客户端参数错）-> 快速失败，冷却换号，不重试
-    全部账号失败后抛 RateLimited 或最后一个错误。
-    """
-    realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
-    model = str(payload.get("model") or "")
-    model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
-
-    representative = POOL.pick(realm=realm) if POOL else None
-    body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
-    encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
-
-    if not session_key:
-        session_key = derive_affinity_key(body_obj.get("messages"))
-        if session_key and AFFINITY_DEBUG:
-            log("affinity: derived %s for %d msgs"
-                % (session_key, len(body_obj.get("messages") or [])))
-
-    total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
-    tried = set()
-    last_error = None
-    last_429 = None
-    last_429_detail = ""
-    waited_cool = False
-
-    # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
-    # tried 集合自然终止）。
-    for _ in range(total + 2):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
+    def select_account(self):
+        if len(self.tried) >= 3:
+            raise UpstreamStatus(503, "account attempt budget exhausted")
+        limit = qoder_settings.gateway_settings(ACCOUNTS_DIR)["pool_max_inflight"]
+        try:
+            excluded = self.tried | ({a.uid for a in POOL.accounts if a.uid != self.account_uid}
+                                     if POOL and self.account_uid else set())
+            self.lease = POOL.acquire(realm=self.realm, model=self.model_key,
+                                      session_key=self.session_key, exclude=excluded,
+                                      max_inflight=limit) if POOL else None
+        except qoder_accounts.PoolBusy as exc:
+            info = qoder_errors.ErrorInfo("pool_busy", "service", 503,
+                                         "account_pool_busy", 503,
+                                         "all eligible accounts are at capacity", 1)
+            raise UpstreamStatus(503, info.message, info) from exc
+        account = self.lease.account if self.lease else None
         if account is None:
-            if not waited_cool:
-                wait = _short_error_cooldown_wait(realm, model,
-                                                  exclude=tried)
+            if not self.waited_cooldown:
+                wait = _short_error_cooldown_wait(self.realm, self.model_key, exclude=excluded)
                 if wait > 0:
-                    waited_cool = True
-                    log("accounts in short error-cooldown for '%s' "
-                        "(%.1fs left) - waiting instead of failing"
-                        % (model, wait), level="WARN", tag="chat")
-                    time.sleep(wait + 0.25)
-                    continue     # 冷却到期后重新 pick，服务该请求
-            break
-        if account.realm != realm:
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
-            continue
-        tried.add(account.uid)
-        # 身份相关的 aliyun_user_type 需要真实账号
-        body_obj["aliyun_user_type"] = account.user_type or \
-            qoder_sign.DEFAULT_USER_TYPE
-        encoded = qoder_encode(
-            json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
-        cfg = get_realm_config(account.realm)
-        raw_url = cfg["gateway"] + CHAT_PATH
+                    self.waited_cooldown = True
+                    time.sleep(wait + .25)
+                    return self.select_account()
+            throttled, wait = realm_model_throttled(self.realm, self.model_key)
+            if throttled:
+                raise UpstreamStatus(429, "model rate limit exceeded", info=qoder_errors.classify(429, "", {"Retry-After": str(wait)}))
+            raise UpstreamStatus(503, "no usable account for realm '%s'" % self.realm)
+        self.account = account
+        self.tried.add(account.uid)
+        self.retries = 0
+        self.auth_refreshed = False
+        nid = str(uuid.uuid4())
+        self.ids = {"request_id": nid, "chat_record_id": nid,
+                    "request_set_id": str(uuid.uuid4()), "session_id": str(uuid.uuid4())}
+        self.body = None
 
-        # ---- 发起请求（瞬时上游故障同账号快速重试） ----
-        resp = None
-        last_exc = None
-        detail = ""
-        for tries in range(TRANSIENT_MAX_RETRIES + 1):
+
+def _open_attempt(ctx):
+    if ctx.attempts >= 6:
+        raise UpstreamStatus(503, "inference POST budget exhausted")
+    ctx.attempts += 1
+    if ctx.body is None:
+        ctx.body = build_qoder_body(ctx.payload, ctx.account, ctx.model_key, realm=ctx.realm, ids=ctx.ids)
+        ctx.encoded = qoder_encode(json.dumps(ctx.body, ensure_ascii=False).encode("utf-8"))
+    raw_url = get_realm_config(ctx.realm)["gateway"] + CHAT_PATH
+    headers = SESSIONS.get(ctx.account).headers(ctx.encoded, raw_url, model_key=ctx.model_key)
+    req = urllib.request.Request(validate_public_http_url(raw_url), data=ctx.encoded.encode(),
+                                 method="POST", headers=headers)
+    return urllib.request.urlopen(req, timeout=600)
+
+
+def _poll_queue(ctx, request_set_id, model_key, queue_type, timeout):
+    query = {"requestSetId": request_set_id, "modelKey": model_key}
+    if queue_type:
+        query["queueType"] = queue_type
+    url = (get_realm_config(ctx.realm)["gateway"] + "/algo/api/v2/service/ask/queue/status?"
+           + urllib.parse.urlencode(query))
+    headers = SESSIONS.get(ctx.account).headers("", url, model_key=model_key, sse=False, accept="application/json")
+    headers["X-Request-ID"] = request_set_id
+    req = urllib.request.Request(validate_public_http_url(url), method="GET", headers=headers)
+    deadline = time.monotonic() + timeout
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        body = bytearray()
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("queue query timed out")
+            # read1 返回当前可得数据，避免缓冲层等待填满后才检查预算。
+            chunk = response.read1(min(4096, qoder_errors.MAX_DETAIL_BYTES + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > qoder_errors.MAX_DETAIL_BYTES:
+                raise ValueError("queue response exceeds 64 KiB")
+        return json.loads(body.decode("utf-8"))
+
+
+def _attempt_error(exc):
+    if isinstance(exc, UpstreamStatus):
+        return exc
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            detail = exc.read(qoder_errors.MAX_DETAIL_BYTES + 1).decode("utf-8", "replace")
+            info = qoder_errors.classify(exc.code, detail, exc.headers)
+            return UpstreamStatus(exc.code, detail, info)
+        finally:
+            exc.close()
+    if _is_transient_transport(exc):
+        return UpstreamStatus(502, str(exc))
+    return UpstreamStatus(502, str(exc), qoder_errors.ErrorInfo("protocol", "service", 502, None, 502, str(exc)))
+
+
+def iter_with_recovery(ctx, holder):
+    """HTTP 与 SSE 共用预算；第一条业务 chunk 之后只终止，不重放。"""
+    try:
+        while True:
+            if ctx.account is None:
+                ctx.select_account()
+            holder["usage"] = None
+            holder["_upstream_done"] = False
+            prelude = []
+            prelude_bytes = 0
             try:
-                sess = SESSIONS.get(account)
-                headers = sess.headers(encoded, raw_url, model_key=model_key,
-                                       sse=True)
-                headers["User-Agent"] = CLIENT_UA
-                chat_url = validate_public_http_url(raw_url)
-                req = urllib.request.Request(chat_url,
-                                             data=encoded.encode("utf-8"),
-                                             method="POST", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=600)
-                break
-            except urllib.error.HTTPError as exc:
-                try:
-                    detail = exc.read(600).decode("utf-8", "replace")
-                except Exception:
-                    detail = ""
-                # 错误体只能读一次：把已读详情挂到异常上，处理器二次 read
-                # 会拿到残缺/空内容，统一从 qoder_detail 取。
-                try:
-                    exc.qoder_detail = detail
-                except Exception:
-                    pass
-                last_exc = exc
-                # 429/401/403 与客户端参数错：立即进入分类，不重试
-                if exc.code in (429, 401, 403):
-                    break
-                if _is_transient_upstream(exc.code, detail) \
-                        and tries < TRANSIENT_MAX_RETRIES:
-                    backoff = tries + 1      # 1s, 2s（tries 从 0 计）
-                    log("transient upstream HTTP %d on '%s' model '%s' "
-                        "(try %d/%d), retry in %ds"
-                        % (exc.code, account.uid[:8], model, tries + 1,
-                           TRANSIENT_MAX_RETRIES + 1, backoff),
-                        level="WARN", tag="chat")
-                    time.sleep(backoff)
-                    continue
-                break
+                ctx.response = _open_attempt(ctx)
+                for line in iter_inner_sse(ctx.response, holder):
+                    chunk = json.loads(strip_data_prefix(line.decode("utf-8")))
+                    meaningful = any(any((choice.get("delta") or {}).get(k) for k in
+                                        ("content", "reasoning_content", "tool_calls", "function_call"))
+                                     for choice in chunk.get("choices") or [])
+                    if not ctx.business_started:
+                        if not meaningful:
+                            prelude.append(line)
+                            prelude_bytes += len(line)
+                            if len(prelude) > 128 or prelude_bytes > qoder_errors.MAX_DETAIL_BYTES:
+                                raise ValueError("upstream prelude exceeds limit")
+                            continue
+                        ctx.business_started = True
+                        ctx.first_token_ms = int((time.monotonic() - ctx.started) * 1000)
+                        yield from prelude
+                        prelude.clear()
+                    yield line
+                if not ctx.business_started or not holder.get("_upstream_done"):
+                    detail = "empty or truncated upstream stream"
+                    raise UpstreamStatus(502, detail, qoder_errors.ErrorInfo("protocol", "service", 502, None, 502, detail))
+                if ctx.lease:
+                    ctx.lease.mark_success()
+                return
             except Exception as exc:
-                last_exc = exc
-                detail = ""
-                # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试
-                if _is_transient_transport(exc) \
-                        and tries < TRANSIENT_MAX_RETRIES:
-                    backoff = tries + 1      # 1s, 2s
-                    log("transient transport error on '%s' model '%s' "
-                        "(try %d/%d): %s - retry in %ds"
-                        % (account.uid[:8], model, tries + 1,
-                           TRANSIENT_MAX_RETRIES + 1,
-                           str(exc)[:120], backoff),
-                        level="WARN", tag="chat")
-                    time.sleep(backoff)
+                failure = _attempt_error(exc)
+            finally:
+                ctx.close_response()
+            if ctx.business_started:
+                raise failure
+            info = failure.info
+            if info.kind == "queued":
+                if not ctx.options["queue_enabled"]:
+                    raise failure
+                if ctx.queue_recoveries >= 2 or ctx.attempts >= 6:
+                    raise UpstreamStatus(429, "queue recovery budget exhausted", info)
+                try:
+                    if ctx.lease:
+                        ctx.lease.set_queue_waiting(True)
+                    result = qoder_queue.wait_until_ready(
+                        ctx.ids["request_set_id"], ctx.model_key,
+                        (info.queue_info or {}).get("queueType"), info.queue_info,
+                        ctx.options["queue_max_wait_seconds"] - ctx.queue_wait_seconds,
+                        lambda *args: _poll_queue(ctx, *args), on_wait=ctx.on_wait)
+                    ctx.queue_wait_seconds += result.waited_seconds
+                except qoder_queue.QueueError as exc:
+                    ctx.queue_wait_seconds += exc.waited_seconds
+                    err = qoder_errors.ErrorInfo("queued", "request", exc.http_status, exc.code,
+                                                 exc.http_status, str(exc))
+                    raise UpstreamStatus(exc.http_status, str(exc), err) from exc
+                except BaseException as exc:
+                    ctx.queue_wait_seconds += getattr(exc, "waited_seconds", 0.0)
+                    raise
+                finally:
+                    if ctx.lease:
+                        ctx.lease.set_queue_waiting(False)
+                ctx.queue_recoveries += 1
+                continue
+            if info.kind == "transient" and ctx.retries < TRANSIENT_MAX_RETRIES and ctx.attempts < 6:
+                ctx.retries += 1
+                time.sleep(ctx.retries)
+                continue
+            if info.kind == "auth" and not ctx.auth_refreshed and ctx.attempts < 6:
+                ctx.auth_refreshed = True
+                if ctx.account.refresh():
                     continue
-                break
-
-        if resp is not None:
-            account.clear_error(model=model)
-            return resp, account, encoded
-
-        exc = last_exc
-        # ---- 错误分类（与原有轮换语义一致） ----
-        if isinstance(exc, urllib.error.HTTPError):
-            if exc.code == 429:
-                account.note_error("HTTP 429 (model throttled)", model=model,
-                                   cooldown=60)
-                log("account %s throttled on '%s' (429), retry in 60s"
-                    % (account.uid[:8], model))
-                if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
-                last_error = exc
-                last_429 = exc
-                last_429_detail = detail
-                continue
-            if exc.code in (401, 403):
-                log("account %s rejected (HTTP %s), rotating"
-                    % (account.uid[:8], exc.code))
-                if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
-                dead = qoder_accounts.session_dead(detail)
-                account.note_error("HTTP %s %s" % (exc.code, detail[:80]),
-                                   cooldown=300 if dead else 60,
-                                   single_account=(total <= 1))
-                if dead:
-                    account.enabled = False
-                    account.save(ACCOUNTS_DIR) if account.path else None
-                    log("account %s session dead (TOKEN_EXPIRE) - disabled"
-                        % account.uid[:8], level="ERROR")
-                last_error = exc
-                continue
-            if _is_transient_upstream(exc.code, detail):
-                # 重试后仍是瞬时故障：上游侧问题，短冷却换号（不重罚账号）
-                if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
-                account.note_error(
-                    "HTTP %s upstream transient: %s" % (exc.code, detail[:80]),
-                    cooldown=15, single_account=(total <= 1))
-                log("upstream still transient (HTTP %d) after %d tries on "
-                    "'%s' - short cooldown, rotating"
-                    % (exc.code, TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
-                    level="WARN", tag="chat")
-                last_error = exc
-                continue
-            # 其他 4xx（客户端参数/请求形态问题）：快速失败，冷却换号
-            if 400 <= exc.code < 500:
-                if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
-                account.note_error("HTTP %s: %s" % (exc.code, detail[:80]),
-                                   cooldown=60, single_account=(total <= 1))
-                last_error = exc
-                continue
-            raise
-        else:
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
-            if exc is not None:
-                if _is_transient_transport(exc):
-                    # 传输抖动重试耗尽：短冷却换号（不重罚账号）
-                    account.note_error("transport transient: %s" % str(exc)[:100],
-                                       cooldown=15, single_account=(total <= 1))
-                    log("upstream transport still failing after %d tries on "
-                        "'%s' - short cooldown"
-                        % (TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
-                        level="WARN", tag="chat")
-                else:
-                    account.note_error(str(exc)[:120], cooldown=60,
-                                       single_account=(total <= 1))
-                last_error = exc
-            continue
-
-    if last_error is not None:
-        if last_429 is not None:
-            raise RateLimited(last_429, last_429_detail,
-                              wait=retry_after_seconds(model, realm))
-        raise last_error
-    throttled, wait = realm_model_throttled(realm, model)
-    if throttled:
-        raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
-    raise RuntimeError(
-        "no usable account for realm '%s': all are disabled, cooling down, or expired"
-        % realm)
+            if info.kind in ("request", "content", "context", "forbidden", "protocol"):
+                raise failure
+            if info.kind == "model_rate":
+                ctx.account.note_error(info.message, model=ctx.model_key,
+                                       cooldown=info.retry_after_seconds or 1, kind=info.kind)
+            elif info.kind == "dead_session":
+                ctx.account.enabled = False
+                ctx.account.note_error("session dead: re-login required", cooldown=300, kind=info.kind)
+                if ctx.account.path:
+                    ctx.account.save(ACCOUNTS_DIR)
+            else:
+                ctx.account.note_error(info.message, cooldown=15 if info.kind == "transient" else 60,
+                                       single_account=bool(POOL and len(POOL.accounts) <= 1), kind=info.kind)
+            if ctx.account_uid or ctx.attempts >= 6 or len(ctx.tried) >= 3:
+                raise failure
+            if not POOL or not any(a.realm == ctx.realm and a.uid not in ctx.tried and
+                                   a.enabled and a.access_token for a in POOL.accounts):
+                raise failure
+            ctx.close()
+            ctx.account = None
+    finally:
+        ctx.close()
 
 
 def iter_inner_sse(resp, holder=None):
@@ -2731,17 +2606,27 @@ def iter_inner_sse(resp, holder=None):
             continue
         status = outer.get("statusCodeValue")
         body = outer.get("body")
+        if any(key in outer for key in ("code", "errorCode", "error")):
+            raise UpstreamStatus(status, json.dumps(outer, ensure_ascii=False))
         if status not in (None, 200, "200"):
             raise UpstreamStatus(status, body if isinstance(body, str)
-                                 else json.dumps(outer, ensure_ascii=False)[:400])
+                                 else json.dumps(outer, ensure_ascii=False))
         if not isinstance(body, str):
             continue
         if body == "[DONE]":
+            if holder is not None:
+                holder["_upstream_done"] = True
             break
         try:
             inner = json.loads(body)
         except Exception:
             continue
+        if not isinstance(inner, dict):
+            continue
+        if "error" in inner or ("code" in inner and not inner.get("choices")):
+            raise UpstreamStatus(status, body)
+        if holder is not None and any(c.get("finish_reason") for c in inner.get("choices") or []):
+            holder["_upstream_done"] = True
         if holder is not None and inner.get("usage") and not holder.get("usage"):
             holder["usage"] = inner["usage"]
         cleaned = clean_chunk(body)
@@ -2750,7 +2635,7 @@ def iter_inner_sse(resp, holder=None):
         yield ("data: " + cleaned + "\n\n").encode("utf-8")
 
 
-def aggregate_stream(resp, model, resp_id=None, holder=None):
+def aggregate_stream(resp, model, resp_id=None, holder=None, inner_lines=None):
     """把上游信封流折叠成一个非流式 chat.completion 对象。"""
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
@@ -2759,7 +2644,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None):
     first_chunk_at = None
     created = None
 
-    for line in iter_inner_sse(resp, holder=holder):
+    for line in (inner_lines if inner_lines is not None else iter_inner_sse(resp, holder=holder)):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
             continue
@@ -3332,6 +3217,9 @@ def stream_responses_events(inner_lines, model, holder):
         body = json.dumps(data, ensure_ascii=False)
         return ("event: " + etype + "\ndata: " + body + "\n\n").encode("utf-8")
 
+    holder["_response_event"] = ev
+    holder["_response_failed"] = lambda: resp_obj("failed")
+
     def reason_item(status):
         return {
             "id": rs_id,
@@ -3706,11 +3594,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
         log(fmt % args)
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -3811,7 +3701,7 @@ class Handler(BaseHTTPRequestHandler):
 
         Priority: an explicit ?realm= argument, then the realm bound to the
         API key, then the X-Realm header / ?realm= query, and finally the
-        global switch. Returning None lets open_upstream() fall back to
+        global switch. Returning None lets RequestContext fall back to
         model-based detection.
         """
         if explicit:
@@ -3961,6 +3851,7 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts": account_views(realm=query.get("realm", [None])[0]
                                           or CURRENT_REALM),
                 "storage": ACCOUNTS_DIR,
+                "credits_details_enabled": qoder_settings.gateway_settings(ACCOUNTS_DIR)["credits_details_enabled"],
                 "usable": POOL.count_ready() if POOL else 0,
             })
         if path == "/accounts/export":
@@ -4024,9 +3915,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             import qoder_tasks
             uid = (query.get("uid") or [None])[0]
-            view = qoder_tasks.fetch_tasks_view(POOL, uid=uid)
-            if view.get("msg") and not view.get("tasks"):
-                return self._json(200, view)
+            realm = (query.get("realm") or [None])[0]
+            if realm not in (None, "cn", "intl"):
+                return self._error(400, "realm must be cn or intl", "invalid_request_error")
+            enabled = qoder_settings.gateway_settings(ACCOUNTS_DIR)["credits_details_enabled"]
+            try:
+                view = qoder_tasks.fetch_tasks_view(POOL, realm=realm, uid=uid,
+                    credits_service=qoder_credits.SERVICE if enabled else None)
+            except qoder_credits.CreditsBusy:
+                return self._error(503, "credits refresh busy", "server_busy")
             return self._json(200, view)
         if path == "/scheduler":
             if not self._authorized():
@@ -4137,6 +4034,11 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error()
         if payload is None:
             return
+        if "gateway" in payload:
+            try:
+                qoder_settings.validate_gateway(payload["gateway"])
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
         reply = {}
         if "api_keys" in payload:
             raw = payload.get("api_keys")
@@ -4203,6 +4105,8 @@ class Handler(BaseHTTPRequestHandler):
                 SCHEDULER.stop()
                 SCHEDULER.start()
             reply["scheduler"] = "restarted"
+        if "gateway" in payload:
+            qoder_settings.set_gateway(ACCOUNTS_DIR, payload["gateway"])
         reply.update(runtime_settings_view())
         return self._json(200, reply)
 
@@ -4276,7 +4180,31 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             return self._error(400, "expected a JSON object",
                                "invalid_request_error")
+        if path in ("/accounts/credits/details", "/tasks/campaign/claim"):
+            if not qoder_settings.gateway_settings(ACCOUNTS_DIR)["credits_details_enabled"]:
+                return self._error(400, "credits details feature is disabled", "feature_disabled")
+            uid = payload.get("uid")
+            if not isinstance(uid, str) or not uid or uid == "all":
+                return self._error(400, "a single account uid is required", "invalid_request_error")
+            account = POOL.get(uid)
+            if account is None:
+                return self._error(404, "no such account", "invalid_request_error")
+            try:
+                if path == "/accounts/credits/details":
+                    return self._json(200, {"uid": uid, "credits_details":
+                        qoder_credits.SERVICE.details(account, force=payload.get("force") is True)})
+                campaign_id = payload.get("campaign_id")
+                if not isinstance(campaign_id, str) or not campaign_id:
+                    return self._error(400, "campaign_id is required", "invalid_request_error")
+                if not account.enabled or not account.access_token:
+                    return self._error(400, "account is disabled or has no credentials", "invalid_request_error")
+                return self._json(200, qoder_credits.SERVICE.claim(account, campaign_id))
+            except qoder_credits.CreditsBusy:
+                return self._error(503, "credits refresh busy", "server_busy")
         if path in ("/accounts/credits", "/accounts/credits/fetch"):
+            include_details = payload.get("details") is True
+            if include_details and not qoder_settings.gateway_settings(ACCOUNTS_DIR)["credits_details_enabled"]:
+                return self._error(400, "credits details feature is disabled", "feature_disabled")
             uid = payload.get("uid")
             realm = payload.get("realm")
             if uid:
@@ -4295,6 +4223,14 @@ class Handler(BaseHTTPRequestHandler):
                                 "credits": account.credits,
                                 "plan": account.plan,
                                 "error": res.get("error", "")})
+            if include_details:
+                try:
+                    snapshots = qoder_credits.SERVICE.bulk([a for a in targets if a is not None],
+                                                          force=payload.get("force") is True)
+                except qoder_credits.CreditsBusy:
+                    return self._error(503, "credits refresh busy", "server_busy")
+                for result, snapshot in zip(results, snapshots):
+                    result["credits_details"] = snapshot
             return self._json(200, {"results": results,
                                     "accounts": account_views()})
         if path == "/tasks/run":
@@ -4476,56 +4412,29 @@ class Handler(BaseHTTPRequestHandler):
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
             }
-            t0 = time.time()
+            blocked = self._cross_realm_error(test_model, account.realm)
+            if blocked:
+                return self._error(400, blocked, "invalid_request_error")
+            ctx = RequestContext(test_payload, account.realm,
+                                 options=qoder_settings.gateway_settings(ACCOUNTS_DIR),
+                                 account_uid=account.uid)
+            inner = iter_with_recovery(ctx, {})
             try:
-                resp, acc, _ = open_upstream(test_payload, target_realm=acc_realm(account))
-                with resp:
-                    chat_obj = aggregate_stream(resp, test_model, None)
-                wall_ms = int((time.time() - t0) * 1000)
+                chat_obj = aggregate_stream(None, test_model, inner_lines=inner)
                 choices = chat_obj.get("choices") or []
                 msg = (choices[0].get("message") or {}) if choices else {}
-                reply_text = (msg.get("content") or msg.get("reasoning_content")
-                              or "OK").strip()
-                if len(reply_text) > 80:
-                    reply_text = reply_text[:77] + "..."
-                account.clear_error()
-                log("account test: uid=%s model=%s wall=%dms ok=True"
-                    % (account.uid[:8], test_model, wall_ms), tag="accounts")
+                reply = (msg.get("content") or msg.get("reasoning_content") or "OK").strip()
                 return self._json(200, {"ok": True, "uid": account.uid,
-                                        "model": test_model,
-                                        "elapsed_ms": wall_ms,
-                                        "reply": reply_text})
-            except RateLimited as exc:
-                wall_ms = int((time.time() - t0) * 1000)
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": 429,
-                                        "error": "rate limited: %s" % exc.detail[:150],
-                                        "elapsed_ms": wall_ms})
-            except urllib.error.HTTPError as exc:
-                wall_ms = int((time.time() - t0) * 1000)
-                try:
-                    detail = exc.read(400).decode("utf-8", "replace")
-                except Exception:
-                    detail = ""
-                account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
-                                   cooldown=60)
-                log("account test: uid=%s model=%s wall=%dms error=%d"
-                    % (account.uid[:8], test_model, wall_ms, exc.code),
-                    level="WARN", tag="accounts")
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": exc.code,
-                                        "error": "HTTP %d: %s"
-                                        % (exc.code, detail[:150]),
-                                        "elapsed_ms": wall_ms})
+                    "model": test_model, "elapsed_ms": int((time.monotonic()-ctx.started)*1000),
+                    "reply": reply if len(reply) <= 80 else reply[:77] + "..."})
             except Exception as exc:
-                wall_ms = int((time.time() - t0) * 1000)
-                account.note_error(str(exc)[:80], cooldown=60)
-                log("account test: uid=%s model=%s wall=%dms exc=%s"
-                    % (account.uid[:8], test_model, wall_ms, exc),
-                    level="WARN", tag="accounts")
+                failure = _attempt_error(exc)
                 return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": 500, "error": str(exc),
-                                        "elapsed_ms": wall_ms})
+                    "status": failure.info.public_http_status, "error": failure.info.message[:150],
+                    "elapsed_ms": int((time.monotonic()-ctx.started)*1000)})
+            finally:
+                inner.close()
+                ctx.close()
         if path == "/accounts/set":
             uid = payload.get("uid")
             if not uid:
@@ -4545,6 +4454,7 @@ class Handler(BaseHTTPRequestHandler):
             if not uid:
                 return self._error(400, "uid required")
             removed = POOL.remove(uid)
+            qoder_credits.SERVICE.invalidate(uid=uid)
             log("account %s deleted" % uid[:8])
             return self._json(200, {"deleted": removed,
                                     "accounts": account_views()})
@@ -4575,6 +4485,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             report = POOL.import_rows(rows, realm=forced_realm,
                                       overwrite=overwrite)
+            for uid in report["updated"]:
+                qoder_credits.SERVICE.invalidate(uid=uid)
             log("account import: %d added, %d updated, %d skipped, %d invalid"
                 % (len(report["added"]), len(report["updated"]),
                    len(report["skipped"]), len(report["invalid"])))
@@ -4587,170 +4499,142 @@ class Handler(BaseHTTPRequestHandler):
                            "invalid_request_error")
 
     def _handle_responses(self, payload):
-        """Serve /v1/responses by translating to chat completions upstream."""
-        session_key = extract_session_key(self.headers, payload)
-        custom_names = custom_tool_names(payload.get("tools"))
-        chat_req = responses_to_chat(payload)
-        model = payload.get("model") or "auto"
-        want_stream = bool(payload.get("stream"))
-        t_start = time.time()
-        fp = prompt_fingerprint(chat_req.get("messages"))
-        log("responses: model=%s stream=%s msgs=%d effort=%r custom_tools=%s"
-            % (model, want_stream, len(chat_req.get("messages") or []),
-               chat_req.get("reasoning_effort"),
-               sorted(custom_names) or "-"))
-        holder = {"usage": None, "custom_names": custom_names}
+        return self._handle_inference(payload, responses=True)
+
+    def _handle_inference(self, payload, responses=False):
+        """协议边界只负责转换和输出，恢复及账号资源由 Context 管理。"""
         try:
-            req_realm = self._request_realm() or CURRENT_REALM
-            blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
-            if blocked:
-                return self._error(400, blocked, "invalid_request_error")
-            upstream, account, _ = open_upstream(
-                chat_req, session_key=session_key, target_realm=req_realm)
-        except RateLimited as exc:
-            t = time.time() - t_start
-            record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int(t * 1000))
-            return self._rate_limited(exc)
-        except urllib.error.HTTPError as exc:
-            # 错误体在 open_upstream 中已读过（挂在 qoder_detail），二次 read
-            # 会拿到残缺内容——优先取挂载值。
-            detail = getattr(exc, "qoder_detail", "")
-            if not detail:
-                try:
-                    detail = exc.read(600).decode("utf-8", "replace")
-                except Exception:
-                    detail = ""
-            record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
-            msg, etype = friendly_upstream_error(exc.code, detail)
-            return self._error(exc.code, msg, etype)
-        except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
-            if message.startswith("no usable account"):
-                return self._error(503, message
-                                   + " - add or enable one at the dashboard (/)")
-            return self._error(502, "upstream unreachable: %s" % exc)
-        with upstream:
-            if want_stream:
-                self.send_response(200)
-                self.send_header("Content-Type",
-                                 "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                if cors_origin_allowed(self.path):
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                first_ms = None
-                # 流内信封重试：上游可能 HTTP200 建流后在信封里投 418
-                # （access log 记 200 + 业务错 418 即此形态）。只要还没向
-                # 客户端写出任何上游字节，就重开上游再试。
-                attempts = 0
-                cur = upstream
-                pump_exc = None
-                try:
-                    while True:
-                        try:
-                            # 统计已消费的上游数据行：错误信封本身不产出
-                            # 行，故 n==0 表示还没消费到任何上游数据 → 可重开
-                            consumed = {"n": 0}
+            if not isinstance(payload, dict):
+                raise ValueError("object required")
+            if payload.get("model") is not None and not isinstance(payload["model"], str):
+                raise ValueError("model must be a string")
+            for key in ("tools", "messages"):
+                if key in payload and payload[key] is not None and (
+                        not isinstance(payload[key], list) or not all(isinstance(item, dict) for item in payload[key])):
+                    raise ValueError("invalid list")
+            if responses and payload.get("input") is not None and not isinstance(payload["input"], (str, list)):
+                raise ValueError("input must be a string or list")
+            session_key = extract_session_key(self.headers, payload)
+            custom_names = custom_tool_names(payload.get("tools")) if responses else set()
+            normalized = responses_to_chat(payload) if responses else copy.deepcopy(payload)
+            if not responses:
+                normalize_tool_choice(normalized)
+                normalize_tools(normalized)
+                translate_max_completion_tokens(normalized)
+        except (TypeError, ValueError, AttributeError):
+            return self._error(400, "invalid request structure", "invalid_request_error")
+        model = normalized.get("model") or "auto"
+        realm = self._request_realm() or CURRENT_REALM
+        blocked = self._cross_realm_error(model, realm)
+        if blocked:
+            return self._error(400, blocked, "invalid_request_error")
+        stream = bool(payload.get("stream"))
+        holder = {"usage": None, "custom_names": custom_names}
+        ctx = RequestContext(normalized, realm, session_key,
+                             qoder_settings.gateway_settings(ACCOUNTS_DIR))
+        fingerprint = prompt_fingerprint(normalized.get("messages"))
+        headers_sent = False
+        last_heartbeat = None
+        inner = None
 
-                            def _count_src(src, _c=consumed):
-                                for item in src:
-                                    _c["n"] += 1
-                                    yield item
-
-                            inner = _count_src(
-                                iter_inner_sse(cur, holder=holder))
-                            for frame in stream_responses_events(inner, model, holder):
-                                if first_ms is None:
-                                    first_ms = int((time.time() - t_start) * 1000)
-                                self.wfile.write(clean_responses_frame(frame))
-                                self.wfile.flush()
-                            break
-                        except (BrokenPipeError, ConnectionResetError,
-                                ConnectionAbortedError):
-                            wall = int((time.time() - t_start) * 1000)
-                            record_usage(model, holder.get("usage"), stream=True,
-                                         elapsed_ms=wall, ttft_ms=first_ms,
-                                         gen_ms=(wall - first_ms)
-                                         if first_ms is not None else None,
-                                         fp=fp, account=account.uid)
-                            return
-                        except UpstreamStatus as exc:
-                            # 控制帧（response.created 等）先于数据，不能算
-                            # “已输出”；以上游数据行计数判断能否重开。
-                            if should_retry_envelope(exc, False, attempts) \
-                                    and consumed.get("n", 0) == 0:
-                                attempts += 1
-                                log("responses in-stream envelope status %s "
-                                    "(try %d/%d), reopening upstream"
-                                    % (exc.status, attempts + 1,
-                                       TRANSIENT_MAX_RETRIES + 1),
-                                    level="WARN", tag="chat")
-                                time.sleep(attempts)
-                                try:
-                                    cur2, account, _ = open_upstream(
-                                        payload, session_key=session_key,
-                                        target_realm=req_realm)
-                                except Exception as rex:
-                                    log("responses reopen failed: %s"
-                                        % str(rex)[:160], level="WARN")
-                                    pump_exc = exc
-                                    break
-                                if cur is not upstream:
-                                    try:
-                                        cur.close()
-                                    except Exception:
-                                        pass
-                                cur = cur2
-                                continue
-                            pump_exc = exc
-                            break
-                finally:
-                    if cur is not upstream:
-                        try:
-                            cur.close()
-                        except Exception:
-                            pass
-                if pump_exc is not None:
-                    record_error(model, pump_exc.status, pump_exc.detail,
-                                 elapsed_ms=int((time.time() - t_start) * 1000))
-                    msg, _ = friendly_upstream_error(
-                        _to_int_status(pump_exc.status), pump_exc.detail)
-                    log("responses upstream status %s: %s"
-                        % (pump_exc.status, msg[:200]), level="ERROR",
-                        tag="chat")
-                    return
-                wall = int((time.time() - t_start) * 1000)
-                record_usage(model, holder.get("usage"), stream=True,
-                             elapsed_ms=wall, ttft_ms=first_ms,
-                             gen_ms=(wall - first_ms)
-                             if first_ms is not None else None,
-                             fp=fp, account=account.uid)
+        def begin_stream():
+            nonlocal headers_sent
+            if headers_sent:
                 return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            if cors_origin_allowed(self.path):
+                self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            headers_sent = True
+            self.close_connection = True
+
+        def write(frame):
+            self.wfile.write(frame)
+            self.wfile.flush()
+
+        def heartbeat():
+            nonlocal last_heartbeat
+            now = time.monotonic()
+            if stream and (last_heartbeat is None or now - last_heartbeat >= 10):
+                begin_stream()
+                write(b": queue waiting\n\n")
+                last_heartbeat = now
+
+        ctx.on_wait = heartbeat
+        outcome, failure = "success", None
+        try:
+            inner = iter_with_recovery(ctx, holder)
+            first = next(inner)
+            lines = itertools.chain((first,), inner)
+            if stream:
+                begin_stream()
+                if responses:
+                    for frame in stream_responses_events(lines, model, holder):
+                        write(clean_responses_frame(frame))
+                else:
+                    for frame in lines:
+                        write(frame)
+                    write(b"data: [DONE]\n\n")
+            else:
+                result = aggregate_stream(None, model, holder=holder, inner_lines=lines)
+                if responses:
+                    result = chat_to_response(result, model, custom_names)
+                self._json(200, result)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            outcome = "client_aborted"
+        except Exception as exc:
+            outcome = "failed"
+            failure = _attempt_error(exc)
+            info = failure.info
+            message, error_type = friendly_upstream_error(info.public_http_status, failure.detail,
+                                                          info=info, retried=ctx.attempts > 1)
+            if info.kind in ("queued", "pool_busy"):
+                error_type = qoder_errors.public_error_type(info)
+            error = {"message": message, "type": error_type,
+                     "code": info.upstream_code or info.kind}
+            if info.public_http_status == 429 or info.kind == "pool_busy":
+                error["retry_after"] = max(1, int(info.retry_after_seconds or 3))
+                if info.kind == "model_rate":
+                    error["code"] = 429
             try:
-                chat_obj, account = aggregate_with_envelope_retry(
-                    upstream, payload, session_key, req_realm, model,
-                    holder, account)
-            except UpstreamStatus as exc:
-                record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
-                msg, etype = friendly_upstream_error(_to_int_status(exc.status),
-                                                     exc.detail)
-                return self._error(exc.status if str(exc.status).isdigit() else 502,
-                                   msg, etype)
-            except Exception as exc:
-                record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
-                return self._error(502, "upstream stream error: %s" % exc)
-            wall = int((time.time() - t_start) * 1000)
-            result = chat_to_response(chat_obj, model, custom_names)
-            record_usage(model, chat_obj.get("usage"), stream=False,
-                         elapsed_ms=wall, fp=fp, account=account.uid)
-            return self._json(200, result)
+                if headers_sent:
+                    if responses:
+                        if "_response_event" not in holder:
+                            # 排队保活已提交头但尚无 created：复用同一转换器建立响应身份。
+                            bootstrap = stream_responses_events((), model, holder)
+                            write(next(bootstrap))
+                            write(next(bootstrap))
+                            bootstrap.close()
+                        failed = holder["_response_failed"]()
+                        failed["error"] = error
+                        write(holder["_response_event"]("response.failed", {"response": failed}))
+                    else:
+                        write(("data: " + json.dumps({"error": error}, ensure_ascii=False) + "\n\n").encode())
+                        write(b"data: [DONE]\n\n")
+                else:
+                    extra = {"Retry-After": str(error["retry_after"])} if "retry_after" in error else None
+                    self._json(info.public_http_status, {"error": error}, headers=extra)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                outcome = "client_aborted"
+        finally:
+            if inner is not None:
+                inner.close()
+            ctx.close()
+            elapsed = int((time.monotonic() - ctx.started) * 1000)
+            if outcome == "failed":
+                record_error(model, failure.info.public_http_status, failure.detail, elapsed_ms=elapsed,
+                             ctx=ctx, usage=holder.get("usage"), stream=stream)
+            elif outcome == "client_aborted":
+                record_error(model, "client_aborted", "client disconnected", elapsed_ms=elapsed,
+                             ctx=ctx, usage=holder.get("usage"), outcome=outcome, stream=stream)
+            else:
+                record_usage(model, holder.get("usage"), stream=stream, elapsed_ms=elapsed,
+                             ttft_ms=ctx.first_token_ms,
+                             gen_ms=elapsed - ctx.first_token_ms if ctx.first_token_ms is not None else None,
+                             fp=fingerprint, account=ctx.account.uid if ctx.account else None, ctx=ctx)
 
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -4786,188 +4670,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
 
-        # ---- Chat Completions 主链路 ----
-        normalize_tool_choice(payload)
-        normalize_tools(payload)
-        translate_max_completion_tokens(payload)
-        model = payload.get("model") or "auto"
-        payload.setdefault("stream", False)
-        # 保持原始终端 stream 意图
-        want_stream = bool(payload.get("stream"))
-        # 转换统一在 build_qoder_body 内做（压平/清洗/工具）
-        session_key = extract_session_key(self.headers, payload)
-        fp = prompt_fingerprint(payload.get("messages"))
-        t_start = time.time()
-        effort = payload.get("reasoning_effort") or \
-            (payload.get("reasoning") or {}).get("effort") \
-            if isinstance(payload.get("reasoning"), dict) \
-            else payload.get("reasoning_effort")
-        log("chat: model=%s client_effort=%r stream=%s msgs=%d"
-            % (model, effort, want_stream,
-               len(payload.get("messages") or [])))
-        try:
-            req_realm = self._request_realm() or CURRENT_REALM
-            blocked = self._cross_realm_error(model, req_realm)
-            if blocked:
-                return self._error(400, blocked, "invalid_request_error")
-            upstream, account, _ = open_upstream(payload, session_key=session_key,
-                                                 target_realm=req_realm)
-        except RateLimited as exc:
-            record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int((time.time() - t_start) * 1000))
-            return self._rate_limited(exc)
-        except urllib.error.HTTPError as exc:
-            # 错误体在 open_upstream 中已读过（挂在 qoder_detail），二次 read
-            # 会拿到残缺内容——优先取挂载值。
-            detail = getattr(exc, "qoder_detail", "")
-            if not detail:
-                try:
-                    detail = exc.read(600).decode("utf-8", "replace")
-                except Exception:
-                    detail = ""
-            record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
-            msg, etype = friendly_upstream_error(exc.code, detail)
-            return self._error(exc.code, msg, etype)
-        except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
-            if message.startswith("no usable account"):
-                return self._error(503, message
-                                   + " - add or enable one at the dashboard (/)")
-            return self._error(502, "upstream unreachable: %s" % exc)
+        return self._handle_inference(payload)
 
-        with upstream:
-            holder = {"usage": None}
-            if want_stream:
-                self.send_response(200)
-                self.send_header("Content-Type",
-                                 "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                if cors_origin_allowed(self.path):
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                emitted = False
-                first_ms = None
-                # 流内信封重试（同上：200 建流后信封投 418 的形态），仅在
-                # 尚未向客户端写出任何上游字节时重开。
-                attempts = 0
-                cur = upstream
-                pump_exc = None
-                try:
-                    while True:
-                        try:
-                            for line in iter_inner_sse(cur, holder=holder):
-                                if first_ms is None:
-                                    first_ms = int((time.time() - t_start) * 1000)
-                                emitted = True
-                                self.wfile.write(line)
-                                self.wfile.flush()
-                            break
-                        except (BrokenPipeError, ConnectionResetError,
-                                ConnectionAbortedError):
-                            # 客户端断开；上游已产出的部分照常记账。
-                            wall = int((time.time() - t_start) * 1000)
-                            record_usage(model, holder.get("usage"), stream=True,
-                                         elapsed_ms=wall, ttft_ms=first_ms,
-                                         gen_ms=(wall - first_ms)
-                                         if first_ms is not None else None,
-                                         fp=fp, account=account.uid)
-                            return
-                        except UpstreamStatus as exc:
-                            if should_retry_envelope(exc, emitted, attempts):
-                                attempts += 1
-                                log("chat in-stream envelope status %s on "
-                                    "model '%s' (try %d/%d), reopening upstream"
-                                    % (exc.status, model, attempts + 1,
-                                       TRANSIENT_MAX_RETRIES + 1),
-                                    level="WARN", tag="chat")
-                                time.sleep(attempts)
-                                try:
-                                    cur2, account, _ = open_upstream(
-                                        payload, session_key=session_key,
-                                        target_realm=req_realm)
-                                except Exception as rex:
-                                    log("chat reopen failed: %s"
-                                        % str(rex)[:160], level="WARN")
-                                    pump_exc = exc
-                                    break
-                                if cur is not upstream:
-                                    try:
-                                        cur.close()
-                                    except Exception:
-                                        pass
-                                cur = cur2
-                                continue
-                            pump_exc = exc
-                            break
-                finally:
-                    if cur is not upstream:
-                        try:
-                            cur.close()
-                        except Exception:
-                            pass
-                if pump_exc is not None:
-                    exc = pump_exc
-                    wall = int((time.time() - t_start) * 1000)
-                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
-                    msg, etype = friendly_upstream_error(
-                        _to_int_status(exc.status), exc.detail)
-                    err = json.dumps({"error": {
-                        "message": msg, "type": etype,
-                        "code": exc.status}}, ensure_ascii=False)
-                    try:
-                        self.wfile.write(("data: %s\n\n" % err).encode("utf-8"))
-                        self.wfile.write(b"data: [DONE]\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        pass
-                    return
-                if not emitted:
-                    err = json.dumps({"error": {
-                        "message": "empty upstream stream",
-                        "type": "server_error"}})
-                    self.wfile.write(("data: %s\n\n" % err).encode("utf-8"))
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-                wall = int((time.time() - t_start) * 1000)
-                record_usage(model, holder.get("usage"), stream=True,
-                             elapsed_ms=wall, ttft_ms=first_ms,
-                             gen_ms=(wall - first_ms)
-                             if first_ms is not None else None,
-                             fp=fp, account=account.uid)
-                return
-            try:
-                result, account = aggregate_with_envelope_retry(
-                    upstream, payload, session_key, req_realm, model,
-                    holder, account)
-            except UpstreamStatus as exc:
-                record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
-                code = exc.status if str(exc.status).isdigit() else 502
-                try:
-                    code = int(code)
-                except Exception:
-                    code = 502
-                if code < 400 or code > 599:
-                    code = 502
-                msg, etype = friendly_upstream_error(
-                    _to_int_status(exc.status), exc.detail)
-                return self._error(code, msg, etype)
-            except Exception as exc:
-                record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
-                return self._error(502, "upstream stream error: %s" % exc)
-            wall = int((time.time() - t_start) * 1000)
-            first_at = result.get("first_chunk_at")
-            first_ms = int((first_at - t_start) * 1000) if first_at else None
-            record_usage(model, result.get("usage"), stream=False,
-                         elapsed_ms=wall, ttft_ms=first_ms,
-                         gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid)
-            return self._json(200, result)
 
 
 def acc_realm(account):
@@ -5082,6 +4786,12 @@ def main():
 
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
+    try:
+        load_usage_summary()
+    except (OSError, ValueError, TypeError) as exc:
+        _usage_summary_state.update(state="degraded", error=type(exc).__name__)
+        log("usage summary recovery failed: %s" % type(exc).__name__, tag="usage")
+    _get_usage_index()
     load_persisted_realm()
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
@@ -5192,6 +4902,9 @@ def main():
     except KeyboardInterrupt:
         log("bye")
     finally:
+        if _usage_index is not None:
+            _usage_index.close()
+        qoder_credits.SERVICE.close()
         try:
             server.server_close()
         except Exception:

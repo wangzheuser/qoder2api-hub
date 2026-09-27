@@ -398,8 +398,8 @@ a:hover{text-decoration:underline}
   <section id="sectionGrowthTasks" style="display:none">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
       <div>
-        <h2 style="margin:0">签到与福利中心</h2>
-        <div style="font-size:12px;color:var(--dim)">全自动每日签到领取积分 (+100/天)，Pro 福利包一次性 +1800，连续签到与额度快照实时刷新</div>
+        <h2 style="margin:0">签到与活动</h2>
+        <div style="font-size:12px;color:var(--dim)">国内签到保持原有规则；通用活动按所选账号查询，逐项手动领取</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <select id="growthAcctSelect" onchange="switchGrowthAccount(this.value)" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--fg);font-family:inherit">
@@ -410,7 +410,7 @@ a:hover{text-decoration:underline}
       </div>
     </div>
 
-    <div class="cards" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
+    <div id="legacyGrowthSummary" class="cards" style="margin-bottom:14px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))">
       <div class="card"><div class="val" id="stkDays">-</div><div class="lbl">连续签到天数</div></div>
       <div class="card accent"><div class="val" id="nrgBalance">-</div><div class="lbl">积分额度余额</div></div>
       <div class="card accent2"><div class="val" id="catState">-</div><div class="lbl" id="catDesc">Pro 福利包状态</div></div>
@@ -503,6 +503,20 @@ a:hover{text-decoration:underline}
     <div style="margin-bottom:16px">
       <h2 style="margin:0;font-size:16px;color:var(--fg)">网关设置</h2>
     </div>
+
+    <section>
+      <h2>请求与账号管理</h2>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+        <label><input type="checkbox" id="gwQueue"> 等待模型排队</label>
+        <label>累计等待（秒） <input id="gwWait" type="number" min="1" max="300" value="120" style="width:80px"></label>
+        <label>每账号并发（0 表示不限） <input id="gwInflight" type="number" min="0" max="16" value="0" style="width:70px"></label>
+        <label><input type="checkbox" id="gwIndex"> 用量查询索引</label>
+        <label><input type="checkbox" id="gwCredits"> 额度明细与通用活动</label>
+        <button onclick="saveGatewaySettings(this)">保存</button>
+      </div>
+      <p class="hint" id="gwStatus">新功能默认关闭，原有账号与额度数据继续保留。</p>
+      <p class="hint" id="usageIndexStatus"></p>
+    </section>
 
     <section>
       <h2>面板访问密码 <em id="setPwdState"></em></h2>
@@ -712,15 +726,19 @@ a:hover{text-decoration:underline}
     <div class="modal-bd">
       <p class="hint" style="margin-top:0">
         选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象
-        (<code>{"accessToken":…}</code>)。
+        (<code>{"accessToken":…}</code>) 及 Cockpit JSON。Cockpit 凭证需选择所属区域。
       </p>
       <div id="importBody"><p class="hint">尚未选择文件。</p></div>
     </div>
     <div class="modal-ft">
       <label class="sec" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
-        <input type="checkbox" id="importOverwrite" style="margin:0">
+        <input type="checkbox" id="importOverwrite" style="margin:0" onchange="previewImport()">
         覆盖同 UID 账号
       </label>
+      <select id="importRealm" onchange="previewImport()" aria-label="导入账号区域">
+        <option value="">使用文件区域（Cockpit 必须选择）</option>
+        <option value="cn">国内版</option><option value="intl">国际版</option>
+      </select>
       <span style="flex:1"></span>
       <button class="sec" onclick="closeImport()">取消</button>
       <button id="btnImportCommit" class="primary" onclick="commitImport(this)" disabled>确认导入</button>
@@ -728,6 +746,12 @@ a:hover{text-decoration:underline}
   </div>
 </div>
 
+<div id="creditsModal" class="modal-mask">
+  <div class="modal">
+    <div class="modal-bd"><h2>额度明细</h2><div id="creditsBody"></div></div>
+    <div class="modal-ft"><button class="sec" onclick="document.getElementById('creditsModal').classList.remove('show')">关闭</button></div>
+  </div>
+</div>
 <script>
 let loginState = null, loginTimer = null;
 
@@ -1129,13 +1153,14 @@ async function switchGrowthAccount(uid){
 async function loadGrowthTasks(){
   const sec = document.getElementById("sectionGrowthTasks");
   if(!sec) return;
-  if(window.VIEW_REALM !== 'cn'){
-    sec.style.display = 'none';   // 官方：签到/福利活动仅国内版
+  if(window.VIEW_REALM !== 'cn' && !window.CREDITS_DETAILS_ENABLED){
+    sec.style.display = 'none';
     return;
   }
   sec.style.display = 'block';
   try{
-    const q = (CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all') ? ('?uid=' + encodeURIComponent(CURRENT_GROWTH_UID)) : '';
+    const q = '?realm=' + encodeURIComponent(window.VIEW_REALM || 'intl')
+      + ((CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all') ? ('&uid=' + encodeURIComponent(CURRENT_GROWTH_UID)) : '');
     const r = await getJSON('/tasks' + q);
     const tasks = r.tasks || [];
     const sum = r.summary || {};
@@ -1143,10 +1168,14 @@ async function loadGrowthTasks(){
     const streak = sum.streak_days || 0;
     const energy = sum.energy || 0;
     const tr = sum.travel || {};
+    const hasCheckin = sum.has_checkin === true;
+    for(const id of ['btnRunTasks', 'btnCatTravel', 'legacyGrowthSummary']){
+      document.getElementById(id).style.display = hasCheckin ? '' : 'none';
+    }
 
     const sel = document.getElementById("growthAcctSelect");
     if(sel && accts.length){
-      const opts = ['<option value="all"' + (CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>全部账号 (批量)</option>']
+      const opts = ['<option value="all"' + (CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>默认账号（国内签到可批量）</option>']
         .concat(accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(a.nickname) + ' (' + esc(a.uid.slice(0,6)) + ')</option>'))
         .join('');
       sel.innerHTML = opts;
@@ -1192,20 +1221,43 @@ async function loadGrowthTasks(){
       } else if(t.status === 'not_accepted'){
         stBadge = '<span class="badge">未接取</span>';
       }
-      const prog = (t.status === 'claimed' || t.status === 'completed') ? '已达成' : (t.current + ' / ' + t.target);
-      const rwd = (t.reward_credit ? ('<b style="color:var(--accent2)">+' + t.reward_credit + '</b> 积分') : '') +
-                  (t.reward_energy ? (' <span style="color:var(--accent)">+' + t.reward_energy + ' 能量</span>') : '');
+      const prog = (t.status === 'claimed' || t.status === 'completed') ? '已达成' : (esc(t.current) + ' / ' + esc(t.target));
+      const rwd = (t.reward_credit ? ('<b style="color:var(--accent2)">+' + esc(t.reward_credit) + '</b> 积分') : '') +
+                  (t.reward_energy ? (' <span style="color:var(--accent)">+' + esc(t.reward_energy) + ' 能量</span>') : '');
+      let action = '';
+      if(t.campaign_id && t.claimable && t.action_type === 'CLAIM_BENEFIT'){
+        action = '<button class="sec mini campaign-claim" data-uid="' + esc(t.uid)
+          + '" data-campaign="' + esc(t.campaign_id) + '">领取</button>';
+      } else if(t.action_type === 'VIEW_DETAILS'){
+        try {
+          const url = new URL(t.jump_url);
+          if(['http:', 'https:'].includes(url.protocol)) action = '<a target="_blank" rel="noopener noreferrer" href="' + esc(url.href) + '">查看详情</a>';
+        } catch(e) {}
+      }
       return '<tr>'
         + '<td><b>' + esc(t.name) + '</b><br><span class="mono" style="font-size:11px;color:var(--dim)">' + esc(t.task_code) + '</span></td>'
         + '<td style="font-size:12px;color:var(--dim);max-width:300px">' + esc(t.description || '-') + '</td>'
         + '<td>' + prog + '</td>'
         + '<td>' + (rwd || '-') + '</td>'
-        + '<td>' + stBadge + '</td>'
+        + '<td>' + stBadge + ' ' + action + '</td>'
         + '</tr>';
     }).join('');
+    tb.querySelectorAll('.campaign-claim').forEach(button => {
+      button.onclick = () => claimCampaign(button.dataset.uid, button.dataset.campaign, button);
+    });
   }catch(e){
     console.error('loadGrowthTasks error:', e);
   }
+}
+
+async function claimCampaign(uid, campaignId, button){
+  button.disabled = true;
+  try {
+    const result = await postJSON('/tasks/campaign/claim', {uid, campaign_id: campaignId});
+    toast(result.claimed ? '领取已确认，额度待刷新' : (result.message || '领取尚未确认，请刷新状态'), result.claimed ? 'ok' : 'warn');
+    await loadGrowthTasks();
+  } catch(e) { toast('领取结果未确认: ' + e.message, 'warn'); }
+  finally { button.disabled = false; }
 }
 
 async function runGrowthTasks(btn){
@@ -1453,6 +1505,11 @@ function accountRow(a){
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
+  const health = '<div class="hint">在途 ' + fmt(a.inFlight || 0) + ' / '
+    + (a.maxInflight ? fmt(a.maxInflight) : '不限') + ' · 排队 ' + fmt(a.queueWaiting || 0)
+    + (a.lastErrorKind ? ' · ' + esc(a.lastErrorKind) : '') + '</div>'
+    + Object.entries(a.modelCooldowns || {}).map(([model, until]) => '<div class="hint">'
+      + esc(model) + ' 冷却 ' + Math.max(0, Math.ceil(Number(until) - Date.now()/1000)) + 's</div>').join('');
   const cred = a.credits;
   const credText = cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size)) : '<span style="color:var(--dim)">未查询</span>';
   return '<tr>'
@@ -1462,7 +1519,7 @@ function accountRow(a){
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
-    + '<td style="text-align:center">' + state + '</td>'
+    + '<td style="text-align:center">' + state + health + '</td>'
     + '<td style="text-align:left;white-space:nowrap">' + credText + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
@@ -1470,6 +1527,7 @@ function accountRow(a){
     + '<td style="text-align:center;white-space:nowrap;vertical-align:middle">'
     + '<div style="display:flex;flex-direction:column;gap:5px;align-items:center;justify-content:center">'
     +   '<div style="display:flex;gap:4px;justify-content:center">'
+    +     (window.CREDITS_DETAILS_ENABLED ? '<button class="sec mini" onclick="showCreditsDetails(&quot;' + uidAttr + '&quot;, this)">明细</button>' : '')
     +     '<button class="sec mini" onclick="toggleAccount(&quot;' + uidAttr + '&quot;,' + (!a.enabled) + ', this)">' + (a.enabled ? '停用' : '启用') + '</button>'
     +     '<button class="sec mini" onclick="testAccount(&quot;' + uidAttr + '&quot;, this)">测试</button>'
     +     '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新</button>'
@@ -1521,6 +1579,7 @@ async function loadAccounts(){
   try{
     const [acct, byAcct] = await Promise.all([getJSON('/accounts?realm=all'), getJSON('/usage/by-account')]);
     window.ACCOUNTS = acct.accounts || [];
+    window.CREDITS_DETAILS_ENABLED = acct.credits_details_enabled === true;
     USAGE_BY_ACCOUNT = {};
     (byAcct.accounts || []).forEach(a => { USAGE_BY_ACCOUNT[a.account] = a; });
     renderAccounts();
@@ -1533,6 +1592,26 @@ async function loadAccounts(){
       }).catch(()=>{});
     }
   }catch(e){ toast('账号加载失败: ' + e.message); }
+}
+
+async function showCreditsDetails(uid, button){
+  if(button) button.disabled = true;
+  document.getElementById('creditsModal').classList.add('show');
+  const body = document.getElementById('creditsBody');
+  body.textContent = '正在查询额度明细…';
+  try {
+    const result = await postJSON('/accounts/credits/details', {uid});
+    const detail = result.credits_details || {};
+    const value = n => n === null || n === undefined ? '暂无数据' : fmt(n);
+    body.innerHTML = '<p>套餐已用 / 总额：' + value(detail.plan_used) + ' / ' + value(detail.plan_total) + '</p>'
+      + '<p>附加已用 / 总额：' + value(detail.addon_used) + ' / ' + value(detail.addon_total) + '</p>'
+      + '<p>总积分：' + value(detail.total_credits) + ' · 峰值：' + value(detail.peak_credits) + '</p>'
+      + '<p class="hint">' + (detail.partial ? '部分数据暂不可用' : '查询完成')
+      + (detail.stale ? ' · 当前显示缓存' : '') + '</p>'
+      + Object.entries(detail.endpoint_status || {}).map(([name, status]) => '<div class="hint">'
+        + esc(name) + '：' + esc(status.status) + '</div>').join('');
+  } catch(e) { body.textContent = '查询失败: ' + e.message; }
+  finally { if(button) button.disabled = false; }
 }
 
 async function fetchCredits(btn){
@@ -1678,9 +1757,37 @@ async function exportOne(uid){
 }
 
 let importRows = null;   // 已解析、待导入的账号行
+let importFilename = '', importRevision = 0, importValidated = null;
+
+function importOptions(){
+  return {realm: document.getElementById('importRealm').value,
+    overwrite: document.getElementById('importOverwrite').checked};
+}
+
+async function previewImport(){
+  const revision = ++importRevision;
+  importValidated = null;
+  document.getElementById('btnImportCommit').disabled = true;
+  if(!importRows) return;
+  const options = importOptions();
+  const rows = importRows;
+  document.getElementById('importBody').textContent = '正在预检…';
+  try {
+    const r = await postJSON('/accounts/import', {data: rows, dryRun: true, ...options});
+    if(revision !== importRevision) return;
+    importValidated = {rows, ...options};
+    renderImportPreview(importFilename, r.result || {}, rows.length);
+  } catch(e) {
+    if(revision === importRevision) document.getElementById('importBody').textContent = '预检失败: ' + e.message;
+  }
+}
 
 function openImport(){
   importRows = null;
+  importValidated = null;
+  importRevision++;
+  document.getElementById('btnImportCommit').disabled = true;
+  document.getElementById('importRealm').value = '';
   const m = document.getElementById('importModal');
   const body = document.getElementById('importBody');
   const ow = document.getElementById('importOverwrite');
@@ -1703,14 +1810,20 @@ function closeImport(){
   const m = document.getElementById('importModal');
   if(m) m.classList.remove('show');
   importRows = null;
+  importValidated = null;
+  importRevision++;
   const btn = document.getElementById('btnImportCommit');
   if(btn) btn.disabled = true;
 }
 
 async function readImportFile(file){
   const body = document.getElementById('importBody');
+  const revision = ++importRevision;
+  importValidated = null;
+  document.getElementById('btnImportCommit').disabled = true;
   try{
     const text = await file.text();
+    if(revision !== importRevision) return;
     let doc;
     try{ doc = JSON.parse(text); }
     catch(e){ throw new Error('文件不是合法 JSON'); }
@@ -1719,16 +1832,15 @@ async function readImportFile(file){
     let rows;
     if(Array.isArray(doc)) rows = doc;
     else if(doc && Array.isArray(doc.accounts)) rows = doc.accounts;
-    else if(doc && (doc.accessToken || doc.auth)) rows = [doc];
+    else if(doc && (doc.accessToken || doc.auth || Object.hasOwn(doc, 'auth_user_info_raw'))) rows = [doc];
     else throw new Error('文件里没有找到账号（既没有 accounts 数组，也不是单个账号）');
 
     if(!rows.length) throw new Error('账号列表是空的');
     importRows = rows;
-
-    // Dry-run first so the user sees exactly what will happen.
-    const r = await postJSON('/accounts/import', {data: doc, dryRun: true});
-    renderImportPreview(file.name, r.result || {}, rows.length);
+    importFilename = file.name;
+    await previewImport();
   }catch(e){
+    if(revision !== importRevision) return;
     importRows = null;
     const btn = document.getElementById('btnImportCommit');
     if(btn) btn.disabled = true;
@@ -1761,6 +1873,7 @@ function renderImportPreview(filename, res, total){
   if(updated.length) html += '<div style="margin-bottom:8px"><b>将覆盖</b><ul class="hint" style="margin:4px 0 0 18px;padding:0">' + rowsHtml(updated) + '</ul></div>';
   if(skipped.length) html += '<div style="margin-bottom:8px"><b>将跳过</b><ul class="hint" style="margin:4px 0 0 18px;padding:0">' + rowsHtml(skipped) + '</ul></div>';
   if(invalid.length) html += '<div style="margin-bottom:8px"><b>无法解析</b><ul class="hint" style="margin:4px 0 0 18px;padding:0">' + rowsHtml(invalid) + '</ul></div>';
+  if(res.warnings?.length) html += '<div><b>导入提示</b><ul class="hint">' + rowsHtml(res.warnings) + '</ul></div>';
 
   if(!added.length && !updated.length){
     html += '<p class="hint" style="color:var(--warn)">没有可导入的账号。'
@@ -1776,14 +1889,16 @@ function renderImportPreview(filename, res, total){
 }
 
 async function commitImport(btn){
-  if(!importRows) return;
-  const ow = document.getElementById('importOverwrite');
-  const overwrite = !!(ow && ow.checked);
+  if(!importRows || !importValidated) return;
+  const options = importOptions();
+  if(options.realm !== importValidated.realm || options.overwrite !== importValidated.overwrite) return previewImport();
+  const validated = importValidated;
+  const overwrite = validated.overwrite;
   if(overwrite && !confirm('将覆盖同 UID 的现有账号（含其凭证），确定继续？')) return;
 
   if(btn){ btn.disabled = true; btn.textContent = '导入中...'; }
   try{
-    const r = await postJSON('/accounts/import', {data: importRows, overwrite: overwrite});
+    const r = await postJSON('/accounts/import', {data: validated.rows, realm: validated.realm, overwrite});
     const res = r.result || {};
     const n = (res.added || []).length + (res.updated || []).length;
     toast('导入完成：新增 ' + (res.added || []).length
@@ -2375,6 +2490,19 @@ async function startDashboard(){
 async function loadSettings(showToast){
   try {
     const data = await getJSON('/settings');
+    const gateway = data.gateway || {};
+    document.getElementById('gwQueue').checked = gateway.queue_enabled === true;
+    document.getElementById('gwWait').value = gateway.queue_max_wait_seconds ?? 120;
+    document.getElementById('gwInflight').value = gateway.pool_max_inflight ?? 0;
+    document.getElementById('gwIndex').checked = gateway.usage_index_enabled === true;
+    document.getElementById('gwCredits').checked = gateway.credits_details_enabled === true;
+    window.CREDITS_DETAILS_ENABLED = gateway.credits_details_enabled === true;
+    renderAccounts();
+    const index = data.usage_index || {};
+    document.getElementById('usageIndexStatus').textContent = '用量索引：' + (index.state || 'disabled')
+      + (index.last_error ? ' · ' + index.last_error : '')
+      + (index.summary?.state === 'historical_difference' ? ' · 历史汇总超出日志范围，已保留旧总计' : '')
+      + (index.persist_errors ? ' · 记录写入失败 ' + index.persist_errors + ' 次' : '');
     const pwdState = document.getElementById('setPwdState');
     if(pwdState){
       pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
@@ -2414,6 +2542,22 @@ async function loadSettings(showToast){
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
   }
+}
+
+async function saveGatewaySettings(btn){
+  btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {gateway: {
+      queue_enabled: document.getElementById('gwQueue').checked,
+      queue_max_wait_seconds: Number(document.getElementById('gwWait').value),
+      pool_max_inflight: Number(document.getElementById('gwInflight').value),
+      usage_index_enabled: document.getElementById('gwIndex').checked,
+      credits_details_enabled: document.getElementById('gwCredits').checked,
+    }});
+    toast('请求与账号设置已保存', 'ok');
+    await loadSettings();
+  } catch(e) { toast('保存失败: ' + e.message, 'bad'); }
+  finally { btn.disabled = false; }
 }
 
 async function savePanelPassword(btn){

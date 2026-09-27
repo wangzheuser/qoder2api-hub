@@ -265,11 +265,13 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 ## 六、开发与测试
 
 ```bash
-# 离线确定性测试（209 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
+# 离线确定性测试（AES-128/256 标准向量与独立合成 KAT、QMC/凭证解密、
 # 自定义 B64、COSY 签名、双区官方目录全字段（峰谷价/多窗口/思考档位/展示 id/解析）、
 # 独占路由、签到能力门控与 DISABLED 归一化、请求体、信封解包、custom 工具转译、
-# 本机凭证扫描）
-python _test_qoder.py
+# 默认隔离本机缓存及凭证，阻止真实网络访问）
+python _test_qoder.py --offline
+python -m unittest discover -s tests -p "test_*.py" -v
+# 本机凭证扫描单独启用（只读）：python _test_qoder.py --local-credentials
 
 # 直接启动
 python qoder_proxy.py --port 8790
@@ -283,6 +285,52 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 模块结构：
 
+面板“请求与账号管理”保存到 `accounts/settings.json` 的 `gateway` 段。
+旧配置缺少该段时采用以下默认值；更新只合并提交字段，保留账号和鉴权设置。
+
+| 配置 | 默认值 | 范围 / 行为 |
+|---|---|---|
+| `queue_enabled` | `false` | 是否在请求内等待模型队列 |
+| `queue_max_wait_seconds` | `120` | 1～300，整请求累计排队时间 |
+| `pool_max_inflight` | `0` | 0～16，0 不限制；建议启用时设 2 |
+| `usage_index_enabled` | `false` | JSONL 的可重建 SQLite 查询索引 |
+| `credits_details_enabled` | `false` | 懒加载额度明细与通用活动 |
+
+账号并发按 `realm + uid` 的请求租约计数。同账号重试和模型排队期间保留占用，
+换号或请求结束时释放；调低上限不会中断已有请求。全部合格账号满载时返回
+HTTP 503、`account_pool_busy` 和 `Retry-After`，不处罚账号。
+面板显示在途数、排队数和模型冷却。模型冷却保存在
+`accounts/.runtime/pool-state.json`，重启后继续到期，成功请求不会清除其他请求的有效冷却。
+
+用量继续写入 `usage/usage.jsonl`；开启索引后后台增量构建
+`usage/usage-index.sqlite3`。分页的总数与行使用同一日志水位，索引落后超过
+200ms 或读取失败时回退 JSONL。关闭索引仍可读取开启期间的记录。
+索引可重建，半行等待补全、坏行跳过并统计；历史缺少区域的记录归为 `unknown`。
+缺少 usage 的成功请求仍计请求数（`usage_missing=true`）；失败保留部分用量，
+取消单独计 `client_aborted_requests`。启动时比较 summary 与日志，若旧汇总包含
+日志之外的历史则保留并报告差异；若完整日志领先则恢复汇总。
+
+导入同时支持原生 JSON 和 Cockpit 的 `auth_user_info_raw`（对象或 JSON 字符串），
+容器可以是单对象、数组或 `accounts` 数组。Cockpit 必须显式选择 `cn`/`intl`，
+并提供用户 ID、token、有限正数到期时间（秒/毫秒）。过期但有 refreshToken 时
+允许导入并提示首次使用需刷新；预检不调用网络、不写账号。区域或覆盖选项改变后
+会重新预检。相同 UID 跨区域拒绝覆盖；实际覆盖前保留旧文件到
+`accounts/.runtime/import-backups/`，原生导出格式保持。
+
+启用额度明细后，账号「明细」按钮按需查询套餐、附加额度、积分汇总与活动，
+TTL 为 300 秒；缺失数值显示「暂无数据」，不与 0 混淆，也不与旧 quota 余额相加。
+同账号在途刷新合并，跨账号最多 4 个任务运行、8 个任务提交。
+404/410 端点负缓存 1 小时，临时失败缓存 30 秒，强制刷新可重试查询。
+`POST /accounts/credits/details` 接收 `{uid, force?}`；旧额度刷新可选
+`details: true`，默认继续只刷新原有额度。
+
+通用活动与国内签到分别门控，活动仅通过面板单账号按钮调用
+`POST /tasks/campaign/claim`（`{uid, campaign_id}`）。后端检查活动归属、
+`CLAIM_BENEFIT`、`CLAIMABLE` 和有效期，领取 POST 只发送一次；
+HTTP 200 不代表领取成功，必须返回或重新查询确认 `CLAIMED`。
+超时且查询仍未确认时返回 `unknown`，不自动补发；Scheduler 不领取通用活动。
+关闭 `credits_details_enabled` 会停止新明细/领取请求，旧额度与国内签到保持原行为。
+
 | 文件 | 职责 |
 |---|---|
 | `qoder_proxy.py` | 主网关：HTTP 路由、COSY 数据面、双协议转换、用量统计、看板鉴权 |
@@ -292,9 +340,38 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `qoder_tasks.py` | 签到闭环（含 DISABLED 归一化）、Pro 福利包、批量执行、保活巡检 |
 | `qoder_scheduler.py` | 整点排程调度器（09/21 签到 · 22:00 保活，签到按区域门控） |
 | `qoder_settings.py` | 面板密码 (PBKDF2)、多 API Key 出口绑定、会话管理 |
+| `qoder_errors.py` / `qoder_queue.py` | 有界错误分类、模型队列等待与超时 |
+| `qoder_usage.py` | JSONL 的可重建 SQLite 索引与同水位查询 |
+| `qoder_credits.py` | 额度明细缓存、通用活动及单账号手动领取 |
 | `qoder_fingerprint.py` | UID 稳定设备指纹派生 (derive_id) |
 | `baseprompt.json` | 官方推理请求体模板 |
 | `dashboard.html` | 单文件 Web 看板（本地凭证两步扫描导入 + PAT 导入） |
+
+推理恢复在 Chat/Responses、流式/非流式之间共用预算：每账号最多额外重试 2 次，
+每个客户端请求最多尝试 3 个账号、发送 6 次推理 POST。排队恢复最多 2 次、
+累计等待由配置控制，进程同时等待最多 16 个请求。输出业务数据后不再重放。
+参数、内容与上下文错误不处罚账号；排队不视为账号故障。
+
+离线回归（标准库，合成凭证与假上游）：
+
+```powershell
+python "_test_qoder.py" --offline
+python -m unittest discover -s "tests" -p "test_*.py" -v
+```
+
+页面测试可用开发环境的 Playwright：
+`node "tests/dashboard_ui.cjs" --playwright "<模块路径>" --browser "<Chromium路径>"`。
+运行时无需安装 Playwright 或其他 pip/npm 依赖。
+这些检查覆盖离线和本机 HTTP/浏览器行为；真实 cn/intl 端点、实际排队及活动到账
+仍需使用获准账号单独验证。功能开关默认关闭，不因升级自动启用或领取。
+
+本轮 S0～S7 的主机与 Python 3.11 Docker 离线验收均为既有脚本 256 项、
+单元/集成测试 150 项通过；Chromium 假后端覆盖 7 组页面场景。
+用量索引基于 10 万行夹具与原实现对照，all/cn 查询中位耗时分别提速约 6.4/14.7 倍；
+这是本机夹具结果，不代表实际生产吞吐。
+验收包位于 `.omx/artifacts/p0-p2/`，含源码快照、完整差异、原始测试结果及
+只针对标记独立副本的 `ROLLBACK.sh`。恢复原始代码前应停止目标实例；账号 JSON
+和 JSONL 是兼容记录源，SQLite 索引可重建。回退脚本不操作当前工作目录或真实数据。
 
 ---
 

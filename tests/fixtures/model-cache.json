@@ -1,0 +1,10 @@
+{
+  "source": "Synthetic QMC v1 KAT independently generated with cryptography HKDF-SHA256 and AESGCM; nonce 000102030405060708090a0b; empty AAD; no gateway code imported",
+  "input": {
+    "uid": "synthetic-model-user"
+  },
+  "expected": {
+    "encrypted": "UU1DAQABAgMEBQYHCAkKC26prq7sFHjnDcAi/l2tf2sn/JG7kCPuVLi4u/szJCeWa16r1AfvVJXupFjbVcrsP7nFOnyzxi6gD2062DJE462Be96pLl8iJIALCWfHujNOv4Eq8aM=",
+    "decrypted": "{\"chat\":[{\"key\":\"synthetic-model\",\"display_name\":\"Synthetic model\"}]}"
+  }
+}
